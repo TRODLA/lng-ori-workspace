@@ -599,8 +599,12 @@ _COPILOT_LIMIT = __import__('threading').BoundedSemaphore(4)
 def _ori_copilot_post(handler):
     if os.environ.get('COPILOT_ENABLED', 'false').lower() != 'true':
         handler.send(503, {'error': 'Copilot is disabled in this environment.'}); return
-    if not handler.host_ok() or handler.headers.get('X-ORI-Token') != TOKEN or not handler.origin_ok(handler.headers.get('Origin')):
-        handler.send(403, {'error': 'Reload the workspace and try again.'}); return
+    if not handler.host_ok():
+        handler.send(403, {'error': 'Chat request host is not allowed. Check the dev ALLOWED_HOSTS configuration.'}); return
+    if handler.headers.get('X-ORI-Token') != TOKEN:
+        handler.send(403, {'error': 'Workspace request token mismatch. Refresh the page with Ctrl+Shift+R. If repeated, check that dev has exactly one replica and no rolling deployment is active.'}); return
+    if not handler.origin_ok(handler.headers.get('Origin')):
+        handler.send(403, {'error': 'Chat request origin is not allowed. Open the configured dev app address directly, not through another domain.'}); return
     if 'application/json' not in handler.headers.get('Content-Type', ''):
         handler.send(415, {'error': 'Expected JSON.'}); return
     length = int(handler.headers.get('Content-Length', '0'))
@@ -612,7 +616,7 @@ def _ori_copilot_post(handler):
         handler.send(400, {'error': 'Enter a message of 1 to 12,000 characters.'}); return
     # Only proxy-injected access-token headers. Never use Authorization (ID token).
     # Deploy only behind the Radix OAuth2 ingress, not a directly exposed backend.
-    access_token = handler.headers.get('X-Auth-Request-Access-Token', '').strip()
+    access_token = handler.headers.get('X-Forwarded-Access-Token', '').strip()
     if not access_token:
         handler.send(401, {'error': 'No Radix access-token header received. Check OAuth2 forwarding and sign in again.'}); return
     # Local diagnostic checks only. Power Platform validates the actual token.
