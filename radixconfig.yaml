@@ -1,9 +1,7 @@
 apiVersion: radix.equinor.com/v1
 kind: RadixApplication
-
 metadata:
-  name: lng-ori-workspace     # 👈 must be lowercase, no spaces
-
+  name: lng-ori-workspace
 spec:
   environments:
     - name: dev
@@ -12,11 +10,9 @@ spec:
     - name: prod
       build:
         from: main
-
   components:
-    - name: dashapp           # 👈 your component name
+    - name: dashapp
       src: "."
-      
       authentication:
         oauth2:
           clientId: "681c8b9e-27ff-4f18-805e-8daa750a4466"
@@ -24,16 +20,21 @@ spec:
           setXAuthRequestHeaders: true
           setAuthorizationHeader: true
           sessionStoreType: systemManaged
-                          # 👈 build from your repo
-      public: true            # 👈 exposes a public URL
+      public: true
       ports:
         - name: http
-          port: 8501          # 👈 must match app.run(port=8050)
+          port: 8501
       publicPort: http
-      
       environmentConfig:
         - environment: dev
           replicas: 1
+          authentication:
+            oauth2:
+              scope: "openid profile email offline_access https://api.powerplatform.com/.default"
+          variables:
+            COPILOT_ENABLED: "true"
+            COPILOT_CONNECTION_STRING: "https://7adc1300acf5ed298ce9089ddb02b0.58.environment.api.powerplatform.com/copilotstudio/agenticruntime/3p/dataverse-backed/authenticated/bots/cr090_lngoriagenta_hkxJTg/conversations?api-version=2022-03-01-preview"
+            ALLOWED_HOSTS: "dashapp-lng-ori-workspace-dev.radix.equinor.com"
           resources:
             requests:
               memory: "512Mi"
@@ -43,6 +44,8 @@ spec:
               cpu: "200m"
         - environment: prod
           replicas: 2
+          variables:
+            COPILOT_ENABLED: "false"
           resources:
             requests:
               memory: "512Mi"

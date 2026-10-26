@@ -584,6 +584,125 @@ def validate(n):
                     raise ValueError('Map ' + key + ' must be finite decimal degrees in the valid range')
 # END LNG ORI V16 VALIDATION
 
+
+_ORI_COPILOT_ENDPOINT = 'https://7adc1300acf5ed298ce9089ddb02b0.58.environment.api.powerplatform.com/copilotstudio/agenticruntime/3p/dataverse-backed/authenticated/bots/cr090_lngoriagenta_hkxJTg/conversations?api-version=2022-03-01-preview'
+
+# Copilot integration: read-only, no automatic workspace data transfer.
+import asyncio as _ori_asyncio
+import hashlib as _ori_hashlib
+import time as _ori_time
+import secrets as _ori_secrets
+_COPILOT_SESSIONS = {}
+_COPILOT_LOCK = threading.Lock() if 'threading' in globals() else __import__('threading').Lock()
+_COPILOT_LIMIT = __import__('threading').BoundedSemaphore(4)
+
+def _ori_copilot_post(handler):
+    if os.environ.get('COPILOT_ENABLED', 'false').lower() != 'true':
+        handler.send(503, {'error': 'Copilot is disabled in this environment.'}); return
+    if not handler.host_ok() or handler.headers.get('X-ORI-Token') != TOKEN or not handler.origin_ok(handler.headers.get('Origin')):
+        handler.send(403, {'error': 'Reload the workspace and try again.'}); return
+    if 'application/json' not in handler.headers.get('Content-Type', ''):
+        handler.send(415, {'error': 'Expected JSON.'}); return
+    length = int(handler.headers.get('Content-Length', '0'))
+    if not 0 < length <= 40000:
+        handler.send(413, {'error': 'Chat request is too large.'}); return
+    body = json.loads(handler.rfile.read(length))
+    question = body.get('message', '')
+    if not isinstance(question, str) or not 0 < len(question.strip()) <= 12000:
+        handler.send(400, {'error': 'Enter a message of 1 to 12,000 characters.'}); return
+    # Only proxy-injected access-token headers. Never use Authorization (ID token).
+    # Deploy only behind the Radix OAuth2 ingress, not a directly exposed backend.
+    access_token = handler.headers.get('X-Auth-Request-Access-Token', '').strip()
+    if not access_token:
+        handler.send(401, {'error': 'No Radix access-token header received. Check OAuth2 forwarding and sign in again.'}); return
+    # Local diagnostic checks only. Power Platform validates the actual token.
+    # Never return claims or token values to the browser or logs.
+    try:
+        part = access_token.split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+        if claims.get('exp', 0) <= _ori_time.time() + 10:
+            handler.send(401, {'error': 'Your access token has expired. Sign out and sign in again.'}); return
+        if 'CopilotStudio.Copilots.Invoke' not in claims.get('scp', '').split():
+            handler.send(403, {'error': 'The forwarded token lacks CopilotStudio.Copilots.Invoke. Deploy the dev OAuth2 scope change and sign out/sign in again; consent may require approval.'}); return
+    except (ValueError, IndexError, TypeError, KeyError):
+        handler.send(401, {'error': 'The forwarded access token could not be read. Check Radix OAuth2 configuration.'}); return
+    endpoint = os.environ.get('COPILOT_CONNECTION_STRING', '').strip()
+    if not endpoint:
+        handler.send(503, {'error': 'COPILOT_CONNECTION_STRING is not configured.'}); return
+    # Exact configured destination only: no browser-supplied URL or conversation ID.
+    if endpoint != _ORI_COPILOT_ENDPOINT:
+        handler.send(503, {'error': 'Unexpected agent endpoint. Review server configuration.'}); return
+    session = body.get('session', '')
+    if not isinstance(session, str) or len(session) > 100:
+        handler.send(400, {'error': 'Invalid chat session.'}); return
+    owner = _ori_hashlib.sha256(access_token.encode()).hexdigest()
+    with _COPILOT_LOCK:
+        cutoff = _ori_time.monotonic() - 1800
+        for key in list(_COPILOT_SESSIONS):
+            if _COPILOT_SESSIONS[key]['time'] < cutoff:
+                del _COPILOT_SESSIONS[key]
+        entry = _COPILOT_SESSIONS.get(session)
+        if not entry or entry['owner'] != owner:
+            if len(_COPILOT_SESSIONS) >= 200:
+                handler.send(429, {'error': 'Chat capacity reached. Try a new session later.'}); return
+            session = _ori_secrets.token_urlsafe(32)
+            entry = {'owner': owner, 'conversation': None, 'time': _ori_time.monotonic(), 'busy': False}
+            _COPILOT_SESSIONS[session] = entry
+        if entry['busy']:
+            handler.send(409, {'error': 'A message is already being processed for this chat.'}); return
+        entry['busy'] = True
+    if not _COPILOT_LIMIT.acquire(blocking=False):
+        with _COPILOT_LOCK: entry['busy'] = False
+        handler.send(429, {'error': 'Chat is busy. Try again.'}); return
+    async def run_turn():
+        from microsoft_agents.copilotstudio.client import ConnectionSettings, CopilotClient
+        settings = ConnectionSettings(environment_id='', agent_identifier='', direct_connect_url=endpoint)
+        client = CopilotClient(settings, access_token)
+        conversation = entry['conversation']
+        texts = []
+        def capture(activity, include_text=True):
+            nonlocal conversation
+            conv = getattr(activity, 'conversation', None)
+            if conv and getattr(conv, 'id', None): conversation = conv.id
+            typ = getattr(activity, 'type', '')
+            typ = getattr(typ, 'value', typ)
+            if include_text and typ == 'message' and getattr(activity, 'text', None):
+                texts.append(activity.text)
+        if not conversation:
+            async for activity in client.start_conversation(): capture(activity, False)
+            conversation = conversation or getattr(client, '_current_conversation_id', None)
+            if not conversation: raise RuntimeError('No conversation identifier returned')
+        async for activity in client.ask_question(question.strip(), conversation): capture(activity)
+        return conversation, '\n\n'.join(texts) or 'The agent returned no text. Rich cards and sign-in cards are not supported by this initial chat panel.'
+    try:
+        conversation, answer = _ori_asyncio.run(_ori_asyncio.wait_for(run_turn(), timeout=90))
+        with _COPILOT_LOCK:
+            entry['conversation'] = conversation
+            entry['time'] = _ori_time.monotonic()
+        handler.send(200, {'session': session, 'answer': answer})
+    except ImportError:
+        handler.send(503, {'error': 'Copilot SDK is missing. Rebuild using the updated requirements-radix.txt.'})
+    except Exception:
+        # Do not expose SDK exceptions: they may contain request URLs or credentials.
+        with _COPILOT_LOCK: _COPILOT_SESSIONS.pop(session, None)
+        handler.send(502, {'error': 'Agent request failed. Check agent publishing, user access, consent and token audience. A new chat will be started on retry.'})
+    finally:
+        with _COPILOT_LOCK: entry['busy'] = False
+        _COPILOT_LIMIT.release()
+
+_ORI_PREVIOUS_POST = Handler.do_POST
+
+def _ori_post_with_copilot(self):
+    if urlparse(self.path).path == '/api/copilot/chat':
+        try: _ori_copilot_post(self)
+        except Exception: self.send(400, {'error': 'Invalid chat request.'})
+    else: _ORI_PREVIOUS_POST(self)
+
+Handler.do_POST = _ori_post_with_copilot
+
+if os.environ.get("COPILOT_ENABLED", "false").lower() == "true":
+    HTML = HTML.replace("</body>", '\n<style>\n#ori-cp-open{position:fixed;right:24px;bottom:24px;z-index:9998;border:0;border-radius:28px;padding:14px 22px;background:#5554d9;color:white;box-shadow:0 8px 28px #0003;cursor:pointer;font:600 15px system-ui}\n#ori-cp-panel{position:fixed;right:24px;bottom:82px;width:min(430px,calc(100vw - 32px));height:min(620px,calc(100vh - 110px));z-index:9999;background:var(--panel,#fff);color:var(--text,#18243a);border:1px solid #8a8a9a66;border-radius:18px;box-shadow:0 18px 65px #0004;display:flex;flex-direction:column;overflow:hidden;font:14px system-ui}\n#ori-cp-panel[hidden]{display:none}#ori-cp-panel header{display:flex;align-items:center;gap:10px;padding:16px;border-bottom:1px solid #8884}#ori-cp-panel header strong{flex:1}#ori-cp-panel button{cursor:pointer}#ori-cp-log{flex:1;overflow:auto;padding:14px;white-space:pre-wrap;overflow-wrap:anywhere}#ori-cp-log p{padding:12px;border-radius:12px;background:#8881;margin:0 0 12px}#ori-cp-panel small{padding:10px 16px;color:inherit;opacity:.75}#ori-cp-form{display:flex;gap:8px;padding:12px;border-top:1px solid #8884}#ori-cp-input{flex:1;min-width:0;border:1px solid #8886;border-radius:9px;padding:10px;background:transparent;color:inherit}#ori-cp-form button{border:0;border-radius:9px;padding:10px;background:#5554d9;color:white}\n</style>\n<button id="ori-cp-open" type="button" aria-expanded="false" aria-controls="ori-cp-panel">Ask LNG Copilot</button>\n<section id="ori-cp-panel" hidden aria-label="LNG Copilot chat">\n<header><strong>LNG ORI Copilot</strong><button id="ori-cp-new" type="button">New chat</button><button id="ori-cp-close" type="button" aria-label="Close chat">Close</button></header>\n<small>Read-only chat. No workspace records are sent automatically. Only send approved information. Chat resets on refresh or server restart.</small>\n<div id="ori-cp-log" role="log" aria-live="polite"></div>\n<form id="ori-cp-form"><input id="ori-cp-input" maxlength="12000" placeholder="Ask about LNG or paste approved deal details" aria-label="Message" required><button id="ori-cp-send" type="submit">Send</button></form>\n</section>\n<script>\n(()=>{const el=id=>document.getElementById(id),panel=el(\'ori-cp-panel\'),log=el(\'ori-cp-log\'),input=el(\'ori-cp-input\');let session=\'\',busy=false;\nfunction add(who,text){const p=document.createElement(\'p\');p.textContent=who+\': \'+text;log.appendChild(p);log.scrollTop=log.scrollHeight;}\nel(\'ori-cp-open\').onclick=()=>{panel.hidden=!panel.hidden;el(\'ori-cp-open\').setAttribute(\'aria-expanded\',String(!panel.hidden));if(!panel.hidden)input.focus();};\nel(\'ori-cp-close\').onclick=()=>{panel.hidden=true;el(\'ori-cp-open\').setAttribute(\'aria-expanded\',\'false\');};\nel(\'ori-cp-new\').onclick=()=>{if(busy)return;session=\'\';log.replaceChildren();};\nel(\'ori-cp-form\').onsubmit=async event=>{event.preventDefault();if(busy||!input.value.trim())return;const message=input.value.trim();busy=true;el(\'ori-cp-send\').disabled=true;el(\'ori-cp-new\').disabled=true;el(\'ori-cp-send\').textContent=\'Sending...\';input.value=\'\';add(\'You\',message);\ntry{const response=await fetch(\'/api/copilot/chat\',{method:\'POST\',credentials:\'same-origin\',headers:{\'Content-Type\':\'application/json\',\'X-ORI-Token\':\'__TOKEN__\'},body:JSON.stringify({message,session})});const data=await response.json();if(!response.ok)throw new Error(data.error||\'Chat request failed\');session=data.session;add(\'Copilot\',data.answer);}catch(error){add(\'Connection\',error.message);}finally{busy=false;el(\'ori-cp-send\').disabled=false;el(\'ori-cp-new\').disabled=false;el(\'ori-cp-send\').textContent=\'Send\';input.focus();}};\n})();\n</script>\n' + "</body>")
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
