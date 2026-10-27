@@ -835,6 +835,342 @@ Handler.do_GET=_ext_get
 Handler.do_POST=_ext_post
 
 
+
+# DEV 2026-10-27: Counterpart presentation and session-scoped edit safeguard.
+# Shared-password safeguard only, not identity-based enterprise authorisation.
+# Existing authentication, data paths, report, Copilot and mutation handlers remain intact.
+import hmac as _mode_hmac
+import time as _mode_time
+from html.parser import HTMLParser as _LogoParserBase
+from urllib.request import Request as _LogoRequest, urlopen as _logo_open, build_opener as _logo_opener, HTTPRedirectHandler as _LogoRedirect
+from urllib.parse import urljoin as _logo_join
+
+_DEV_CATALOG = [
+    ('Osaka Gas','https://www.osakagas.co.jp/en/'),
+    ('PTTT','https://www.pttplc.com/en'),
+    ('Vitol','https://www.vitol.com/'),
+    ('Cheniere','https://lngir.cheniere.com/'),
+    ('Prism',''), ('Deepak',''),
+    ('Achema','https://www.achema.lt/en/'),
+    ('PetroChina','https://www.petrochina.com.cn/ptr/'),
+    ('Torrent','https://www.torrentgas.com/'),
+    ('GSPC','https://www.gspcgroup.com/'),
+    ('Argentina LNG','https://argentina-lng.ypf.com/index-en.html'),
+]
+# Prism and Deepak deliberately retain initials until their precise brand is confirmed.
+# PTTT uses PTT branding; Torrent uses Torrent Gas branding. Display names are unchanged.
+_DEV_LOGO_SITES = dict(_DEV_CATALOG)
+_DEV_SESSIONS = {}
+_DEV_ATTEMPTS = {}
+_DEV_LOGO_CACHE = {}
+_DEV_MODE_LOCK = threading.RLock()
+_DEV_PASSWORD = os.environ.get('ORI_EDIT_PASSWORD', 'EQN123')
+
+def _dev_key(name):
+    key=' '.join(str(name or '').strip().lower().split())
+    return {'ptt':'pttt'}.get(key,key)
+
+def _dev_country_region(country):
+    c=str(country or '').lower()
+    groups={'Asia':('japan','jp','china','cn','india','in','thailand','th','singapore','sg','south korea','kr','indonesia','id','taiwan','tw'),
+            'Europe':('lithuania','lt','norway','no','united kingdom','gb','netherlands','nl','switzerland','ch','germany','de','france','fr','spain','es','italy','it','belgium','be'),
+            'North America':('united states','united states of america','us','canada','ca','mexico','mx'),
+            'South America':('argentina','ar','brazil','br','chile','cl','peru','pe'),
+            'Oceania':('australia','au','new zealand','nz')}
+    return next((region for region,names in groups.items() if c in names),'Other / unassigned')
+
+def _dev_enrich(n):
+    cps=n.setdefault('counterparts',[])
+    known={_dev_key(c.get('name')) for c in cps}
+    for name,site in _DEV_CATALOG:
+        if _dev_key(name) not in known:
+            cps.append({'id':str(uuid.uuid5(uuid.NAMESPACE_URL,'lng-ori-counterpart:'+_dev_key(name))),
+                        'name':name,'region':'Other / unassigned','country':'','country_source':'lead',
+                        'responsible':'','contacts':[]})
+            known.add(_dev_key(name))
+    for c in cps:
+        linked=[r for r in n.get('records',[]) if r.get('counterpart_id')==c.get('id') or _dev_key(r.get('counterpart'))==_dev_key(c.get('name'))]
+        countries=list(dict.fromkeys(str(r.get('country') or r.get('country_code') or '').strip() for r in linked if r.get('country') or r.get('country_code')))
+        if c.get('country_source')!='manual' and countries:
+            c['country']=countries[0]
+            c['country_source']='lead'
+        if not c.get('region') or c.get('region')=='Other / unassigned':
+            c['region']=next((r['region'] for r in linked if r.get('region') in ('Asia','Europe','North America','South America','Middle East','Africa','Oceania')), _dev_country_region(c.get('country')))
+    return n
+
+_DEV_PREVIOUS_STATE=state
+def state():
+    # Enrichment is an in-memory view until an authorised save. No read request writes data.
+    return _dev_enrich(_DEV_PREVIOUS_STATE())
+
+_DEV_PREVIOUS_SAVE=save
+def save(n,old):
+    return _DEV_PREVIOUS_SAVE(_dev_enrich(n),old)
+
+class _DevLogoParser(_LogoParserBase):
+    def __init__(self):
+        super().__init__();self.assets=[]
+    def handle_starttag(self,tag,attrs):
+        a=dict(attrs)
+        if tag=='img':
+            src=a.get('src') or a.get('data-src') or ''
+            label=' '.join((src,a.get('alt',''),a.get('class',''),a.get('id',''))).lower()
+            if 'logo' in label and src:self.assets.append((0,src))
+        if tag=='link' and 'icon' in a.get('rel','').lower() and a.get('href'):
+            self.assets.append((1,a['href']))
+
+def _dev_logo_host_ok(url,base):
+    u=urlparse(url);b=urlparse(base)
+    # Only the exact verified website host or its www/non-www counterpart.
+    return u.scheme=='https' and not u.username and not u.password and u.port in (None,443) and u.hostname and u.hostname.removeprefix('www.')==b.hostname.removeprefix('www.')
+
+class _DevLogoRedirect(_LogoRedirect):
+    def __init__(self,base):self.base=base
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        if not _dev_logo_host_ok(newurl,self.base):raise ValueError('Logo redirect outside approved website')
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+
+def _dev_logo_fetch(url,base,limit):
+    if not _dev_logo_host_ok(url,base):raise ValueError('Unapproved logo host')
+    req=_LogoRequest(url,headers={'User-Agent':'Mozilla/5.0 LNG-ORI-Logo/1.0','Accept':'image/*,text/html;q=0.8'})
+    with _logo_opener(_DevLogoRedirect(base)).open(req,timeout=3) as response:
+        raw=response.read(limit+1)
+        if len(raw)>limit:raise ValueError('Logo resource too large')
+        return raw,response.headers.get_content_type()
+
+def _dev_logo(name):
+    base=_DEV_LOGO_SITES.get(name,'')
+    if not base:return None
+    with _DEV_MODE_LOCK:
+        cached=_DEV_LOGO_CACHE.get(name)
+        if cached and cached[0]>_mode_time.monotonic():return cached[1]
+    result=None
+    try:
+        html,ctype=_dev_logo_fetch(base,base,1200000)
+        parser=_DevLogoParser();parser.feed(html.decode('utf-8',errors='replace'))
+        deadline=_mode_time.monotonic()+8
+        for priority,asset in sorted(parser.assets)[:5]:
+            if _mode_time.monotonic()>deadline:break
+            try:
+                raw,mime=_dev_logo_fetch(_logo_join(base,asset),base,1000000)
+                if raw.startswith(b'\x89PNG\r\n\x1a\n'):mime='image/png'
+                elif raw.startswith(b'\xff\xd8\xff'):mime='image/jpeg'
+                elif raw[:6] in (b'GIF87a',b'GIF89a'):mime='image/gif'
+                elif raw[:4]==b'RIFF' and raw[8:12]==b'WEBP':mime='image/webp'
+                elif b'<svg' in raw[:2000] and not any(x in raw.lower() for x in (b'<script',b'foreignobject',b'<!entity',b'javascript:',b'onload=')):
+                    mime='image/svg+xml'
+                else:continue
+                result=(raw,mime);break
+            except Exception:continue
+    except Exception:pass
+    with _DEV_MODE_LOCK:_DEV_LOGO_CACHE[name]=(_mode_time.monotonic()+(86400 if result else 300),result)
+    return result
+
+_DEV_PREVIOUS_GET=Handler.do_GET
+_DEV_PREVIOUS_POST=Handler.do_POST
+
+def _dev_get(self):
+    if urlparse(self.path).path!='/api/counterpart-logo':return _DEV_PREVIOUS_GET(self)
+    if not self.host_ok():self.send(403,{'error':'Invalid host'});return
+    name=_ext_qs(urlparse(self.path).query).get('name',[''])[0]
+    logo=_dev_logo(name)
+    if not logo:self.send(404,{'error':'Logo unavailable; initials shown instead.'});return
+    raw,mime=logo
+    self.send_response(200);self.send_header('Content-Type',mime)
+    self.send_header('Content-Length',str(len(raw)));self.send_header('Cache-Control','private, max-age=86400')
+    self.send_header('X-Content-Type-Options','nosniff')
+    self.send_header('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; sandbox")
+    self.end_headers();self.wfile.write(raw)
+
+def _dev_session_owner(self):
+    return self.headers.get('X-Forwarded-Email','')
+
+def _dev_post(self):
+    p=urlparse(self.path).path
+    if p=='/api/copilot/chat':return _DEV_PREVIOUS_POST(self)
+    if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or self.headers.get('X-ORI-Token')!=TOKEN:
+        self.send(403,{'error':'Invalid request. Reload the app.'});return
+    if p in ('/api/edit/unlock','/api/edit/lock'):
+        try:
+            if 'application/json' not in self.headers.get('Content-Type',''):raise ValueError('Expected JSON')
+            length=int(self.headers.get('Content-Length','0'))
+            if not 0<length<2048:raise ValueError('Invalid request size')
+            body=json.loads(self.rfile.read(length))
+            with _DEV_MODE_LOCK:
+                if p.endswith('/lock'):
+                    _DEV_SESSIONS.pop(self.headers.get('X-ORI-Edit',''),None)
+                    self.send(200,{'mode':'read'});return
+                key=(_dev_session_owner(self),self.client_address[0]);now_m=_mode_time.monotonic()
+                attempts=[t for t in _DEV_ATTEMPTS.get(key,[]) if now_m-t<60]
+                if len(attempts)>=8:self.send(429,{'error':'Too many attempts. Try again after a minute.'});return
+                attempts.append(now_m);_DEV_ATTEMPTS[key]=attempts
+                if len(_DEV_ATTEMPTS)>1024:
+                    for k in list(_DEV_ATTEMPTS):
+                        if not any(now_m-t<60 for t in _DEV_ATTEMPTS[k]):_DEV_ATTEMPTS.pop(k,None)
+                if not _mode_hmac.compare_digest(str(body.get('password','')).encode(),_DEV_PASSWORD.encode()):
+                    self.send(403,{'error':'Incorrect password.'});return
+                _DEV_ATTEMPTS.pop(key,None)
+                if len(_DEV_SESSIONS)>=512:_DEV_SESSIONS.pop(next(iter(_DEV_SESSIONS)))
+                token=secrets.token_urlsafe(40);_DEV_SESSIONS[token]=_dev_session_owner(self)
+                self.send(200,{'mode':'edit','edit_token':token});return
+        except Exception:self.send(400,{'error':'Invalid mode request.'});return
+    # Fail closed for every other POST, including uploads, pricing imports and conversions.
+    with _DEV_MODE_LOCK:
+        token=self.headers.get('X-ORI-Edit','')
+        allowed=bool(token) and token in _DEV_SESSIONS and _DEV_SESSIONS[token]==_dev_session_owner(self)
+    if not allowed:self.send(403,{'error':'Read mode: unlock Edit mode before saving changes.','read_only':True});return
+    return _DEV_PREVIOUS_POST(self)
+
+Handler.do_GET=_dev_get
+Handler.do_POST=_dev_post
+
+_DEV_UI = r"""
+<style>
+#oriModeToggle{margin-left:auto;border-radius:999px;font-weight:650;white-space:nowrap;padding:8px 16px;min-height:40px}
+#oriModeToggle.ori-read{background:#e3f6ec;color:#08623c;border-color:#86c9a5}
+#oriModeToggle.ori-edit{background:#ffebee;color:#a51f38;border-color:#ef9eac}
+body.dark #oriModeToggle.ori-read{background:#123d31;color:#8aefbd;border-color:#2e7c5d}
+body.dark #oriModeToggle.ori-edit{background:#4b2230;color:#ffb5c3;border-color:#a94e65}
+.ori-mode-dialog{width:min(420px,94vw)}.ori-mode-dialog p{color:var(--muted)}
+.ori-mode-dialog input{width:100%;margin:12px 0;padding:10px}.ori-mode-error{color:var(--red);min-height:24px}
+.ori-write-locked{opacity:.45!important;cursor:not-allowed!important}
+.x-region-cloud{position:relative;margin:34px 0;padding:28px 28px 35px;border:1px solid color-mix(in srgb,var(--blue) 19%,transparent);border-radius:58px 90px 65px 42px;background:radial-gradient(ellipse at 35% 45%,color-mix(in srgb,var(--blue) 5%,transparent),transparent 74%)}
+.x-region-cloud:nth-of-type(even){border-radius:90px 45px 80px 65px}
+.x-region-cloud h2{font-size:17px;letter-spacing:.02em;margin:0 0 12px 10px}.x-region-cloud h2 small{font-size:12px;color:var(--muted);margin-left:8px}
+.x-region-cloud .x-bubbles{gap:28px 40px;padding:12px 0;align-items:flex-start}
+.x-region-cloud .x-cp-card{border:0!important;background:transparent!important;box-shadow:none!important;min-width:135px;max-width:165px;padding:8px 5px;transition:transform .18s}
+.x-region-cloud .x-cp-card:hover{transform:translateY(-4px)}
+.x-region-cloud .x-cp-card:nth-child(3n+2){margin-top:16px}.x-region-cloud .x-cp-card:nth-child(3n){margin-top:5px}
+.x-company-circle{background:#fff!important}.x-company-circle>span:not(.x-owner-bubble){color:#235374!important}
+.x-cp-search{margin:20px 0}.x-cp-search input{width:min(520px,100%);padding:11px 15px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--text)}
+@media(max-width:650px){.x-region-cloud{padding:22px 10px;border-radius:32px}.x-region-cloud .x-bubbles{gap:18px 4px}.x-region-cloud .x-cp-card{min-width:125px;max-width:145px}.x-region-cloud .x-cp-card:nth-child(n){margin-top:0}#oriModeToggle{padding:7px 10px}}
+@media(prefers-reduced-motion:reduce){.x-region-cloud .x-cp-card{transition:none}}
+</style>
+<script>
+// The token lives only in this page's memory: reload or re-entry starts in Read mode.
+const ORI_MODE={token:'',busy:false};
+const oriNativeFetch=window.fetch.bind(window);
+window.fetch=async function(input,init={}){
+ const method=String(init.method||(input instanceof Request?input.method:'GET')).toUpperCase();
+ const url=new URL(input instanceof Request?input.url:String(input),location.href);
+ if(url.origin===location.origin&&!['GET','HEAD','OPTIONS'].includes(method)){
+  const exempt=['/api/edit/unlock','/api/edit/lock','/api/copilot/chat'].includes(url.pathname);
+  if(!exempt&&!ORI_MODE.token){toast('Read mode: click the green Read mode button to unlock editing.');return new Response(JSON.stringify({error:'Read mode: unlock editing first.'}),{status:403,headers:{'Content-Type':'application/json'}})}
+  const headers=new Headers(init.headers||(input instanceof Request?input.headers:undefined));
+  if(ORI_MODE.token)headers.set('X-ORI-Edit',ORI_MODE.token);
+  init={...init,headers};
+ }
+ const response=await oriNativeFetch(input,init);
+ if(response.status===403&&ORI_MODE.token&&url.origin===location.origin){
+  try{const data=await response.clone().json();if(data.read_only){ORI_MODE.token='';oriModePaint()}}catch{}
+ }
+ return response;
+};
+function oriModePaint(){
+ const top=document.querySelector('.topbar .actions')||document.querySelector('.topbar');if(!top)return;
+ let b=document.getElementById('oriModeToggle');if(!b){b=document.createElement('button');b.id='oriModeToggle';b.type='button';b.onclick=oriModeClick;top.appendChild(b)}
+ const editing=!!ORI_MODE.token;b.className=editing?'ori-edit':'ori-read';
+ const label=editing?'✎ Edit mode':'🔒 Read mode';if(b.textContent!==label)b.textContent=label;
+ b.setAttribute('aria-label',editing?'Edit mode. Click to return to Read mode.':'Read mode. Click to unlock editing.');b.setAttribute('aria-pressed',String(editing));
+ oriModeControls();
+}
+function oriModeControls(){
+ const editing=!!ORI_MODE.token;
+ for(const el of document.querySelectorAll('button,input[type=file],input[type=submit]')){
+  if(el.closest('#oriModeDialog,#nav,.sidebar')||el.id==='oriModeToggle')continue;
+  const action=el.getAttribute('onclick')||'';const label=(el.textContent||el.value||'').trim();
+  const write=el.type==='file'||el.type==='submit'||/^(?:\+\s*)?(?:Add|Edit|Delete|Remove|Save|Restore|Recover|Import|Upload|Archive|Sign contract|Return to leads|Convert|Create linked|Mark as|Record signing|Move to|Clear saved|Reset workspace)\b/i.test(label)||/\b(?:edit|xeditCP|xaddContact|xremoveContact|ximportCP|xupload|commit|deleteItem|convertRecord|xaddExternal)\s*\(/.test(action);
+  if(!write)continue;
+  if(!editing&&!el.disabled){el.disabled=true;el.dataset.oriModeLocked='1';el.classList.add('ori-write-locked')}
+  if(editing&&el.dataset.oriModeLocked){el.disabled=false;delete el.dataset.oriModeLocked;el.classList.remove('ori-write-locked')}
+ }
+}
+async function oriModeClick(){
+ if(ORI_MODE.busy)return;
+ if(ORI_MODE.token){
+  if((typeof dirty!=='undefined'&&dirty)||(typeof matrixDirty!=='undefined'&&matrixDirty)){
+   if(!confirm('Discard unsaved changes and return to Read mode?'))return;
+  }
+  ORI_MODE.busy=true;
+  try{await api('/api/edit/lock',{});ORI_MODE.token='';
+   if(typeof closeEditor==='function')closeEditor(true);
+   document.querySelectorAll('.x-overlay').forEach(x=>x.remove());
+   if(typeof matrixDirty!=='undefined')matrixDirty=false;
+   if(typeof matrixDraft!=='undefined')matrixDraft=null;
+   render();oriModePaint();
+  }catch(e){toast(e.message)}finally{ORI_MODE.busy=false}return;
+ }
+ if(document.getElementById('oriModeDialog'))return;
+ const host=document.createElement('div');host.className='x-overlay';host.id='oriModeDialog';
+ host.innerHTML=`<form class="x-dialog ori-mode-dialog" role="dialog" aria-modal="true" aria-labelledby="oriModeTitle"><h2 id="oriModeTitle">Enter Edit mode</h2><p>Enter the shared password once. Editing stays unlocked while you use this page. Reloading returns to Read mode.</p><label for="oriModePassword">Password</label><input id="oriModePassword" type="password" autocomplete="current-password" required><div class="ori-mode-error" role="alert"></div><div class="actions"><button type="button" id="oriModeCancel">Cancel</button><button type="submit" class="primary">Unlock editing</button></div></form>`;
+ document.body.appendChild(host);const previous=document.activeElement;
+ const close=()=>{host.remove();previous?.focus()};host.querySelector('#oriModeCancel').onclick=close;
+ host.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();close()}if(e.key==='Tab'){const focus=[...host.querySelectorAll('input,button')].filter(x=>!x.disabled);if(e.shiftKey&&document.activeElement===focus[0]){e.preventDefault();focus.at(-1).focus()}else if(!e.shiftKey&&document.activeElement===focus.at(-1)){e.preventDefault();focus[0].focus()}}};
+ host.querySelector('form').onsubmit=async e=>{e.preventDefault();if(ORI_MODE.busy)return;ORI_MODE.busy=true;const submit=host.querySelector('[type=submit]');submit.disabled=true;
+  try{const d=await api('/api/edit/unlock',{password:host.querySelector('input').value});ORI_MODE.token=d.edit_token;host.querySelector('input').value='';close();oriModePaint();toast('Edit mode unlocked for this page session.')}
+  catch(err){host.querySelector('.ori-mode-error').textContent=err.message;host.querySelector('input').select()}
+  finally{ORI_MODE.busy=false;submit.disabled=false}
+ };host.querySelector('input').focus();
+}
+const oriEditPrevious=edit;
+edit=function(...args){if(!ORI_MODE.token){oriModeClick();return}return oriEditPrevious(...args)};
+const oriCpEditPrevious=xeditCP;
+xeditCP=function(id){
+ if(!ORI_MODE.token){oriModeClick();return}
+ oriCpEditPrevious(id);
+ const c=xcp(id)||{};const old=document.getElementById('xc_country');if(!old)return;
+ const linked=(S.records||[]).filter(r=>r.counterpart_id===id||String(r.counterpart||'').trim().toLowerCase()===String(c.name||'').trim().toLowerCase());
+ const linkedCountries=[...new Set(linked.map(r=>r.country||r.country_code).filter(Boolean))];
+ const inherited=linkedCountries[0]||'';
+ const label=old.parentElement;const select=document.createElement('select');select.id='xc_country';
+ const names=[...new Set(COUNTRIES.map(x=>x.label).concat([c.country,inherited]).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+ select.innerHTML=`<option value="">Not set</option>`+xopts(names,c.country||inherited);old.replaceWith(select);
+ const help=document.createElement('small');help.className='x-muted';help.textContent=inherited?'Default from linked lead: '+inherited+'. Choose a country to override.':'Country follows the linked lead when available. You can also choose it manually.';if(linkedCountries.length>1)help.textContent+=' Multiple lead countries: '+linkedCountries.join(', ')+'. The first linked lead is the default; choose a country to override.';label.appendChild(help);
+ let changed=false;select.onchange=()=>{changed=true};
+ const follow=document.createElement('label');follow.className='full';follow.innerHTML=`<input id="xc_follow_country" type="checkbox" ${c.country_source==='manual'?'':'checked'} style="display:inline;width:auto"> Follow country from linked lead`;
+ label.after(follow);const check=follow.querySelector('input');
+ select.addEventListener('change',()=>{check.checked=false});
+ check.onchange=()=>{changed=true;if(check.checked)select.value=inherited||c.country||''};
+ const button=document.getElementById('xc_save'),savePrevious=button.onclick;
+ button.onclick=async()=>{const previous=xsave;
+  xsave=async function(n){const item=n.counterparts.find(x=>x.id===(id||n.counterparts.at(-1)?.id));if(item)item.country_source=check.checked?'lead':'manual';return previous(n)};
+  try{await savePrevious()}finally{xsave=previous}
+ };
+};
+const oriLogoPrevious=xlogo;
+const oriLogoNames=['Osaka Gas','PTTT','Vitol','Cheniere','Achema','PetroChina','Torrent','GSPC','Argentina LNG'];
+xlogo=function(c){
+ if(c.logo_data)return oriLogoPrevious(c);
+ const key=String(c.name||'').trim().toLowerCase();const name=oriLogoNames.find(n=>n.toLowerCase()===key||(n==='PTTT'&&key==='ptt'));
+ const fallback=oriLogoPrevious(c);if(!name)return fallback;
+ return `<img src="/api/counterpart-logo?name=${encodeURIComponent(name)}" alt="${xe(c.name)} logo" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true;this.nextElementSibling.hidden=false"><span hidden>${xe(String(c.name||'').split(/\s+/).slice(0,2).map(x=>x[0]).join(''))}</span>`;
+};
+const oriCpRenderPrevious=xrenderCP;
+xrenderCP=function(){
+ oriCpRenderPrevious();const page=document.getElementById('page');if(!page)return;
+ if(!XDEV.cp){for(const bubbles of page.querySelectorAll('.x-bubbles')){const section=bubbles.closest('section');if(section){section.classList.remove('panel');section.classList.add('x-region-cloud')}}
+ const search=document.getElementById('xCpQuery');if(search?.parentElement){search.parentElement.classList.remove('panel');search.parentElement.classList.add('x-cp-search')}}
+ oriModePaint();
+};
+ximportCP=async function(){
+ if(!ORI_MODE.token){oriModeClick();return}
+ xinit();const n=copy(S);const norm=s=>String(s||'').trim().toLowerCase();
+ for(const r of n.records){const name=String(r.counterpart||'').trim();if(!name)continue;
+  let c=n.counterparts.find(c=>c.id===r.counterpart_id||norm(c.name)===norm(name));
+  if(!c){c={id:uid(),name,region:r.region||'Other / unassigned',country:r.country||r.country_code||'',country_source:'lead',responsible:'',contacts:[]};n.counterparts.push(c)}
+  if(!r.counterpart_id)r.counterpart_id=c.id;
+ }
+ try{await xsave(n);toast('Counterparts imported and linked to existing deals. Countries follow the linked leads unless overridden.')}catch(e){toast(e.message)}
+};
+const oriNavPrevious=nav;nav=function(){oriNavPrevious();const b=document.querySelector('[data-xcp]');if(b){b.textContent='👤  Counterparts';b.setAttribute('aria-label','Counterparts')}oriModePaint()};
+const oriRenderPrevious=render;render=function(){oriRenderPrevious();oriModePaint()};
+let oriModePending=false;
+new MutationObserver(()=>{if(oriModePending)return;oriModePending=true;requestAnimationFrame(()=>{oriModePending=false;oriModeControls()})}).observe(document.body,{childList:true,subtree:true});
+oriModePaint();
+</script>
+"""
+HTML=HTML.replace('</body>',_DEV_UI+'</body>')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
@@ -844,5 +1180,8 @@ if __name__=='__main__':main()
 # END LNG ORI V19 PRESENTATION
 
 # END LNG ORI V20 PRESENTATION
+
+
+
 
 
