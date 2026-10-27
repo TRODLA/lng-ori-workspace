@@ -1,2 +1,4 @@
 openpyxl>=3.1,<4
 microsoft-agents-copilotstudio-client==1.9.0
+reportlab>=4,<5
+tzdata
