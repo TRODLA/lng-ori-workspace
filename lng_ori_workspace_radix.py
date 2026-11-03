@@ -38,7 +38,7 @@ Country denotes opportunity geography, not any person's nationality.
 import base64,copy,datetime as dt,io,json,math,os,secrets,threading,uuid,webbrowser,zipfile,shutil,tempfile,re
 from azure.identity import ClientSecretCredential
 from azure.storage.filedatalake import DataLakeServiceClient
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceExistsError,ResourceNotFoundError
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -106,8 +106,22 @@ def _storage_file_system():
         _ADLS_FILE_SYSTEM=service.get_file_system_client(AZURE_STORAGE_CONTAINER_NAME)
     return _ADLS_FILE_SYSTEM
 
+def _storage_ensure_parent_directories(relative_path):
+    # ADLS Gen2 does not create missing parent directories when a file is
+    # uploaded. Create origination/backups/<version>/... one level at a time.
+    full_path=_storage_path(relative_path)
+    parent=full_path.rsplit('/',1)[0] if '/' in full_path else ''
+    if not parent:return
+    current=''
+    for part in parent.split('/'):
+        if not part:continue
+        current=f'{current}/{part}' if current else part
+        try:_storage_file_system().create_directory(current)
+        except ResourceExistsError:pass
+
 def _storage_write(relative_path,raw,overwrite=True):
     full_path=_storage_path(relative_path)
+    _storage_ensure_parent_directories(relative_path)
     _storage_file_system().get_file_client(full_path).upload_data(raw,overwrite=overwrite)
     return full_path
 
@@ -2063,3 +2077,4 @@ if __name__=='__main__':main()
 # END LNG ORI V19 PRESENTATION
 
 # END LNG ORI V20 PRESENTATION
+
