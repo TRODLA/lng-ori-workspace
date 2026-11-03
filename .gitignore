@@ -1,0 +1,16 @@
+# Environment files and local secrets
+.env
+.env.*
+*.env
+
+# Allow a safe template without real credentials
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
+env/
