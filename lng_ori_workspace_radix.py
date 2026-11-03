@@ -37,8 +37,8 @@ Country denotes opportunity geography, not any person's nationality.
 """
 import base64,copy,datetime as dt,io,json,math,os,secrets,threading,uuid,webbrowser,zipfile,shutil,tempfile,re
 from azure.identity import ClientSecretCredential
-from azure.storage.filedatalake import DataLakeServiceClient
-from azure.core.exceptions import ResourceExistsError,ResourceNotFoundError
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -62,8 +62,8 @@ AZURE_STORAGE_ACCOUNT_NAME=os.getenv('AZURE_STORAGE_ACCOUNT_NAME','gplngplabqizr
 AZURE_STORAGE_CONTAINER_NAME=os.getenv('AZURE_STORAGE_CONTAINER_NAME','landingzone').strip()
 AZURE_STORAGE_BASE_DIRECTORY=os.getenv('AZURE_STORAGE_BASE_DIRECTORY','origination').strip('/')
 AZURE_STORAGE_BACKUP_DIRECTORY='backups'
-_ADLS_CREDENTIAL=None
-_ADLS_FILE_SYSTEM=None
+_STORAGE_CREDENTIAL=None
+_BLOB_CONTAINER=None
 
 def _storage_require_config():
     values={
@@ -82,51 +82,39 @@ def _storage_path(relative_path=''):
     return '/'.join(parts)
 
 def _storage_credential():
-    global _ADLS_CREDENTIAL
+    global _STORAGE_CREDENTIAL
     _storage_require_config()
-    if _ADLS_CREDENTIAL is None:
-        _ADLS_CREDENTIAL=ClientSecretCredential(
+    if _STORAGE_CREDENTIAL is None:
+        _STORAGE_CREDENTIAL=ClientSecretCredential(
             tenant_id=AZURE_TENANT_ID,
             client_id=AZURE_CLIENT_ID,
             client_secret=AZURE_CLIENT_SECRET,
         )
-    return _ADLS_CREDENTIAL
+    return _STORAGE_CREDENTIAL
 
 def storage_token_expiry():
     # Explicit token test without exposing the token value.
     return _storage_credential().get_token('https://storage.azure.com/.default').expires_on
 
-def _storage_file_system():
-    global _ADLS_FILE_SYSTEM
-    if _ADLS_FILE_SYSTEM is None:
-        service=DataLakeServiceClient(
-            account_url=f'https://{AZURE_STORAGE_ACCOUNT_NAME}.dfs.core.windows.net',
+def _storage_container():
+    global _BLOB_CONTAINER
+    if _BLOB_CONTAINER is None:
+        service=BlobServiceClient(
+            account_url=f'https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net',
             credential=_storage_credential(),
         )
-        _ADLS_FILE_SYSTEM=service.get_file_system_client(AZURE_STORAGE_CONTAINER_NAME)
-    return _ADLS_FILE_SYSTEM
-
-def _storage_ensure_parent_directories(relative_path):
-    # ADLS Gen2 does not create missing parent directories when a file is
-    # uploaded. Create origination/backups/<version>/... one level at a time.
-    full_path=_storage_path(relative_path)
-    parent=full_path.rsplit('/',1)[0] if '/' in full_path else ''
-    if not parent:return
-    current=''
-    for part in parent.split('/'):
-        if not part:continue
-        current=f'{current}/{part}' if current else part
-        try:_storage_file_system().create_directory(current)
-        except ResourceExistsError:pass
+        _BLOB_CONTAINER=service.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
+    return _BLOB_CONTAINER
 
 def _storage_write(relative_path,raw,overwrite=True):
+    # Blob names can contain slashes, so no separate directory-creation call is
+    # required. This avoids ADLS PathNotFound errors for new dated prefixes.
     full_path=_storage_path(relative_path)
-    _storage_ensure_parent_directories(relative_path)
-    _storage_file_system().get_file_client(full_path).upload_data(raw,overwrite=overwrite)
+    _storage_container().get_blob_client(full_path).upload_blob(raw,overwrite=overwrite)
     return full_path
 
 def _storage_read(relative_path):
-    return _storage_file_system().get_file_client(_storage_path(relative_path)).download_file().readall()
+    return _storage_container().get_blob_client(_storage_path(relative_path)).download_blob().readall()
 
 def _storage_json_write(relative_path,value,overwrite=True):
     raw=json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False).encode('utf-8')
@@ -184,14 +172,15 @@ def storage_send_snapshot():
         return manifest
 
 def storage_list_snapshots():
-    prefix=_storage_path(AZURE_STORAGE_BACKUP_DIRECTORY)
-    try:paths=_storage_file_system().get_paths(path=prefix,recursive=False)
-    except ResourceNotFoundError:return []
+    prefix=_storage_path(AZURE_STORAGE_BACKUP_DIRECTORY).rstrip('/')+'/'
     versions=[]
-    for item in paths:
-        if not item.is_directory:continue
-        snapshot_id=item.name.rstrip('/').split('/')[-1]
-        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{6}Z',snapshot_id):continue
+    seen=set()
+    for blob in _storage_container().list_blobs(name_starts_with=prefix):
+        if not blob.name.endswith('/manifest.json'):continue
+        relative=blob.name[len(prefix):]
+        snapshot_id=relative.split('/',1)[0]
+        if snapshot_id in seen or not re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{6}Z',snapshot_id):continue
+        seen.add(snapshot_id)
         try:manifest=_storage_json_read(f'{AZURE_STORAGE_BACKUP_DIRECTORY}/{snapshot_id}/manifest.json')
         except Exception:manifest={'snapshot_id':snapshot_id,'created_at_utc':snapshot_id}
         versions.append(manifest)
@@ -2077,4 +2066,5 @@ if __name__=='__main__':main()
 # END LNG ORI V19 PRESENTATION
 
 # END LNG ORI V20 PRESENTATION
+
 
