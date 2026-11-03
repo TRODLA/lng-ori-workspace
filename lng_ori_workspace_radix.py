@@ -35,13 +35,183 @@ Optional workbook import dependency: python -m pip install openpyxl
 No authentication, shared-user synchronisation or live market data connection.
 Country denotes opportunity geography, not any person's nationality.
 """
-import base64,copy,datetime as dt,io,json,math,os,secrets,threading,uuid,webbrowser,zipfile
+import base64,copy,datetime as dt,io,json,math,os,secrets,threading,uuid,webbrowser,zipfile,shutil,tempfile,re
+from azure.identity import ClientSecretCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+from azure.core.exceptions import ResourceNotFoundError
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import urlparse
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'ori_workspace_data.json';LEGACY=ROOT/'lead_funnel_data.json';CACHE=ROOT/'ori_pricing_snapshot.json';WORKBOOK=ROOT/'Prices.xlsx'
 TOKEN=secrets.token_urlsafe(32);LOCK=threading.RLock()
+
+# Azure Data Lake Storage backup configuration.
+# Radix injects AZURE_CLIENT_SECRET as an environment variable. A local .env
+# file can supply the same variables for development and must remain ignored.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
+AZURE_TENANT_ID=os.getenv('AZURE_TENANT_ID','').strip()
+AZURE_CLIENT_ID=os.getenv('AZURE_CLIENT_ID','').strip()
+AZURE_CLIENT_SECRET=os.getenv('AZURE_CLIENT_SECRET','')
+AZURE_STORAGE_ACCOUNT_NAME=os.getenv('AZURE_STORAGE_ACCOUNT_NAME','gplngplabqizrlz').strip()
+AZURE_STORAGE_CONTAINER_NAME=os.getenv('AZURE_STORAGE_CONTAINER_NAME','landingzone').strip()
+AZURE_STORAGE_BASE_DIRECTORY=os.getenv('AZURE_STORAGE_BASE_DIRECTORY','origination').strip('/')
+AZURE_STORAGE_BACKUP_DIRECTORY='backups'
+_ADLS_CREDENTIAL=None
+_ADLS_FILE_SYSTEM=None
+
+def _storage_require_config():
+    values={
+        'AZURE_TENANT_ID':AZURE_TENANT_ID,
+        'AZURE_CLIENT_ID':AZURE_CLIENT_ID,
+        'AZURE_CLIENT_SECRET':AZURE_CLIENT_SECRET,
+        'AZURE_STORAGE_ACCOUNT_NAME':AZURE_STORAGE_ACCOUNT_NAME,
+        'AZURE_STORAGE_CONTAINER_NAME':AZURE_STORAGE_CONTAINER_NAME,
+    }
+    missing=[name for name,value in values.items() if not value]
+    if missing:raise RuntimeError('Missing required Radix environment variables: '+', '.join(missing))
+
+def _storage_path(relative_path=''):
+    relative=str(relative_path).replace('\\','/').strip('/')
+    parts=[part for part in (AZURE_STORAGE_BASE_DIRECTORY,relative) if part]
+    return '/'.join(parts)
+
+def _storage_credential():
+    global _ADLS_CREDENTIAL
+    _storage_require_config()
+    if _ADLS_CREDENTIAL is None:
+        _ADLS_CREDENTIAL=ClientSecretCredential(
+            tenant_id=AZURE_TENANT_ID,
+            client_id=AZURE_CLIENT_ID,
+            client_secret=AZURE_CLIENT_SECRET,
+        )
+    return _ADLS_CREDENTIAL
+
+def storage_token_expiry():
+    # Explicit token test without exposing the token value.
+    return _storage_credential().get_token('https://storage.azure.com/.default').expires_on
+
+def _storage_file_system():
+    global _ADLS_FILE_SYSTEM
+    if _ADLS_FILE_SYSTEM is None:
+        service=DataLakeServiceClient(
+            account_url=f'https://{AZURE_STORAGE_ACCOUNT_NAME}.dfs.core.windows.net',
+            credential=_storage_credential(),
+        )
+        _ADLS_FILE_SYSTEM=service.get_file_system_client(AZURE_STORAGE_CONTAINER_NAME)
+    return _ADLS_FILE_SYSTEM
+
+def _storage_write(relative_path,raw,overwrite=True):
+    full_path=_storage_path(relative_path)
+    _storage_file_system().get_file_client(full_path).upload_data(raw,overwrite=overwrite)
+    return full_path
+
+def _storage_read(relative_path):
+    return _storage_file_system().get_file_client(_storage_path(relative_path)).download_file().readall()
+
+def _storage_json_write(relative_path,value,overwrite=True):
+    raw=json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False).encode('utf-8')
+    return _storage_write(relative_path,raw,overwrite=overwrite)
+
+def _storage_json_read(relative_path):
+    return json.loads(_storage_read(relative_path).decode('utf-8'))
+
+def _storage_snapshot_id():
+    return dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d_%H%M%SZ')
+
+def _storage_validate_snapshot_id(snapshot_id):
+    snapshot_id=str(snapshot_id or '')
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{6}Z',snapshot_id):raise ValueError('Invalid storage version')
+    return snapshot_id
+
+def storage_send_snapshot():
+    # A version is a complete recoverable workspace JSON plus uploaded files.
+    # URLs and internal links are already represented in the workspace JSON.
+    with LOCK:
+        workspace=state()
+        snapshot_id=_storage_snapshot_id()
+        base=f'{AZURE_STORAGE_BACKUP_DIRECTORY}/{snapshot_id}'
+        get_storage_expiry=storage_token_expiry()
+        documents=[]
+        for item in workspace.get('documents',[]):
+            storage_id=str(item.get('storage_id',''))
+            if not re.fullmatch(r'[0-9a-fA-F-]{36}',storage_id):continue
+            source=_EXT_FILES/storage_id
+            if not source.is_file():
+                raise RuntimeError('Cannot create a complete storage version because an uploaded file is missing locally: '+item.get('name',storage_id))
+            target=f'{base}/documents/{storage_id}'
+            _storage_write(target,source.read_bytes(),overwrite=False)
+            documents.append({'storage_id':storage_id,'name':item.get('name',''),'size':source.stat().st_size,'path':_storage_path(target),'status':'uploaded'})
+        _storage_json_write(f'{base}/workspace.json',workspace,overwrite=False)
+        pricing_saved=False
+        if CACHE.is_file():
+            _storage_write(f'{base}/pricing/ori_pricing_snapshot.json',CACHE.read_bytes(),overwrite=False)
+            pricing_saved=True
+        manifest={
+            'snapshot_id':snapshot_id,
+            'created_at_utc':now(),
+            'application':'LNG ORI Workspace',
+            'workspace_revision':workspace.get('revision',0),
+            'storage_account':AZURE_STORAGE_ACCOUNT_NAME,
+            'container':AZURE_STORAGE_CONTAINER_NAME,
+            'base_directory':AZURE_STORAGE_BASE_DIRECTORY,
+            'workspace_path':_storage_path(f'{base}/workspace.json'),
+            'pricing_snapshot_saved':pricing_saved,
+            'document_count':len(documents),
+            'documents':documents,
+            'token_expires_on':get_storage_expiry,
+        }
+        _storage_json_write(f'{base}/manifest.json',manifest,overwrite=False)
+        return manifest
+
+def storage_list_snapshots():
+    prefix=_storage_path(AZURE_STORAGE_BACKUP_DIRECTORY)
+    try:paths=_storage_file_system().get_paths(path=prefix,recursive=False)
+    except ResourceNotFoundError:return []
+    versions=[]
+    for item in paths:
+        if not item.is_directory:continue
+        snapshot_id=item.name.rstrip('/').split('/')[-1]
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{6}Z',snapshot_id):continue
+        try:manifest=_storage_json_read(f'{AZURE_STORAGE_BACKUP_DIRECTORY}/{snapshot_id}/manifest.json')
+        except Exception:manifest={'snapshot_id':snapshot_id,'created_at_utc':snapshot_id}
+        versions.append(manifest)
+    return sorted(versions,key=lambda x:x.get('snapshot_id',''),reverse=True)
+
+def storage_restore_snapshot(snapshot_id):
+    snapshot_id=_storage_validate_snapshot_id(snapshot_id)
+    base=f'{AZURE_STORAGE_BACKUP_DIRECTORY}/{snapshot_id}'
+    restored=normalise(_storage_json_read(f'{base}/workspace.json'))
+    validate(restored)
+    stage=Path(tempfile.mkdtemp(prefix='ori-storage-restore-',dir=str(ROOT)))
+    stage_docs=stage/'documents';stage_docs.mkdir()
+    document_ids=[]
+    try:
+        for item in restored.get('documents',[]):
+            storage_id=str(item.get('storage_id',''))
+            if not re.fullmatch(r'[0-9a-fA-F-]{36}',storage_id):raise ValueError('Invalid document reference in stored version')
+            raw=_storage_read(f'{base}/documents/{storage_id}')
+            (stage_docs/storage_id).write_bytes(raw);document_ids.append(storage_id)
+        try:pricing_raw=_storage_read(f'{base}/pricing/ori_pricing_snapshot.json')
+        except ResourceNotFoundError:pricing_raw=None
+        with LOCK:
+            if DATA.exists():DATA.with_suffix('.before-storage-restore.json').write_bytes(DATA.read_bytes())
+            atomic(DATA,restored)
+            _EXT_FILES.mkdir(exist_ok=True)
+            for old_file in _EXT_FILES.iterdir():
+                if old_file.is_file():old_file.unlink()
+                elif old_file.is_dir():shutil.rmtree(old_file)
+            for storage_id in document_ids:shutil.move(str(stage_docs/storage_id),str(_EXT_FILES/storage_id))
+            if pricing_raw is not None:
+                if CACHE.exists():CACHE.with_suffix('.before-storage-restore.json').write_bytes(CACHE.read_bytes())
+                CACHE.write_bytes(pricing_raw)
+        return {'state':restored,'snapshot_id':snapshot_id,'documents_restored':len(document_ids),'pricing_restored':pricing_raw is not None}
+    finally:shutil.rmtree(stage,ignore_errors=True)
 COLLECTIONS=['records','needs','intelligence','ideas','links','milestones','actions','resources','comments']
 TYPES={'lead':'records','need':'needs','insight':'intelligence','idea':'ideas'}
 GATES={'dga':'DGA','dgb':'DGB','dgc':'DGC','customisation_meeting':'Customisation meeting','customisation_period':'Customisation period'}
@@ -1797,6 +1967,92 @@ HTML=HTML.replace('</body>',_INSIGHT_IMPORT_UI+'</body>')
 # ORI DEV24 scoped layout amendments
 _ORI_DEV24_LAYOUT_UI='<style id="ori-v24-style">\n.dev21-split.ori24-split{grid-template-columns:minmax(0,1.4fr) minmax(360px,1fr);gap:0;align-items:stretch}.ori24-split>section:first-child{padding-right:24px}.ori24-split>section:last-child{padding-left:24px;border-left:1px solid #fff}.ori24-tender-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;min-height:44px}.ori24-tender-head h1{line-height:1.3}.ori24-tender-head+.muted{min-height:24px}.ori24-tender-head h1{margin:0}.ori24-tender-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:18px 0}.ori24-tender-stats article{border:1px solid var(--line);border-top:3px solid var(--blue);border-radius:9px;background:var(--panel);padding:13px}.ori24-tender-stats strong{display:block;font-size:20px;margin-top:5px}.ori24-tender-search{display:flex;gap:10px;align-items:center;margin:18px 0 14px}.ori24-tender-search input{width:100%;min-width:0;padding:9px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text)}.ori24-tender-table{width:100%;border-collapse:collapse;table-layout:auto}.ori24-tender-table th,.ori24-tender-table td{padding:13px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;font-size:13px}.ori24-tender-table th{background:var(--soft);font-size:12px;color:var(--muted)}.ori24-tender-table td small{display:block;color:var(--muted);margin-top:5px}.ori24-tender-table tr[data-tender]{cursor:pointer;background:var(--panel)}.ori24-tender-table tr[data-tender]:hover,.ori24-tender-table tr[data-tender]:focus-visible{background:var(--soft);outline:2px solid var(--blue);outline-offset:-2px}.ori24-tender-wrap{border:1px solid var(--line);border-radius:9px;overflow:auto}.ori24-tender-table .textbtn{min-height:0;padding:0;font-weight:650;text-align:left}.ori24-tender-empty{padding:20px}.ori24-insight-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:16px!important;align-items:stretch}.ori24-insight-grid>.ori24-insight-card{min-width:0;margin:0!important;padding:17px!important;border:1px solid var(--line)!important;border-radius:12px;background:var(--panel);display:flex!important;flex-direction:column;gap:10px}.ori24-insight-card .v15-input-footer{display:flex;flex-wrap:wrap;gap:7px;margin-top:auto}.ori24-insight-card .v15-input-footer button{font-size:12px;min-height:32px;padding:6px 8px}.ori24-insight-card .v15-input-summary{font-size:13px;line-height:1.6}.ori24-insight-card h3{font-size:17px;margin:0}.ori24-insight-card p{font-size:14px;line-height:1.6;margin:5px 0;overflow-wrap:anywhere}.ori24-insight-card>.actions,.ori24-insight-card>.wf-actions{margin-top:auto}.ori24-card-more{font-size:13px;margin-top:5px}.ori24-card-more summary{cursor:pointer;color:var(--blue)}.ori24-cluster-canvas{position:relative;min-height:600px;width:100%;overflow:auto;border:0;background:transparent;isolation:isolate}.ori24-cluster-canvas>.dev21-region{position:absolute!important;margin:0!important;overflow:visible!important;background:none!important;border:0!important;min-height:0!important}.ori24-cluster-canvas .dev21-region .x-bubbles{position:relative;display:block;margin:0;padding:0}.ori24-cluster-canvas .dev21-region h2{cursor:grab;touch-action:none;user-select:none;width:128px;height:128px;z-index:5;box-shadow:0 8px 28px #0002}.ori24-cluster-canvas .dev21-region h2:active{cursor:grabbing}.ori24-cluster-canvas .dev21-region h2:focus-visible{outline:3px solid var(--blue);outline-offset:5px}.ori24-cluster-canvas .dev21-region .x-cp-card{width:122px!important;max-width:122px!important;min-width:0!important}.ori24-cluster-canvas .x-company-circle{width:82px;height:82px}.ori24-cluster-canvas .x-owner-bubble{font-size:10px;max-width:120px}.ori24-cluster-canvas .x-cp-card strong{font-size:12px;line-height:1.3;display:block}.ori24-cluster-canvas .x-cp-card small{font-size:11px;line-height:1.3;display:block}.ori24-cluster-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0;flex-wrap:wrap}.ori24-cluster-toolbar p{font-size:13px;color:var(--muted);margin:0}.ori24-profile-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 20px;border-bottom:1px solid var(--line);padding-bottom:10px}.ori24-profile-tabs button[aria-selected=true]{background:var(--soft);border-color:var(--blue);color:var(--blue);font-weight:650}.ori24-profile-panel[hidden]{display:none!important}.ori24-profile-panel{min-width:0}.ori24-profile-panel:focus{outline:none}@media(max-width:1100px){.dev21-split.ori24-split{grid-template-columns:1fr}.ori24-split>section:first-child{padding-right:0}.ori24-split>section:last-child{padding-left:0;border-left:0;border-top:1px solid #fff;padding-top:24px;margin-top:24px}}@media(max-width:1200px){.ori24-input-columns{grid-template-columns:1fr!important}}@media(max-width:760px){.ori24-insight-grid{grid-template-columns:1fr!important}.ori24-tender-stats{gap:7px}.ori24-tender-stats article{padding:10px}.ori24-tender-table th,.ori24-tender-table td{padding:10px 7px}}\n</style>\n<script>\n// DEV24 presentation-only patch. No record migrations, API changes or workflow changes.\n(function(){\n\'use strict\';\nif(window.__ORI_LAYOUT_V24__)return;window.__ORI_LAYOUT_V24__=true;\nconst V24={query:\'\',cpTab:\'Overview\',cpId:null,frame:0,applying:false,canvas:null,resize:null,positions:{},positionKey:\'ori-v24-counterpart-clusters\',dragged:false};\ntry{const saved=JSON.parse(localStorage.getItem(V24.positionKey)||\'{}\');if(saved&&typeof saved===\'object\'&&!Array.isArray(saved))V24.positions=saved}catch{}\nconst esc=v=>typeof E===\'function\'?E(String(v??\'\')):String(v??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nfunction savePositions(){try{localStorage.setItem(V24.positionKey,JSON.stringify(V24.positions))}catch{}}\nfunction tableRows(host){const root=host.querySelector(\'[data-v24-tender-rows]\');if(!root)return;const q=V24.query.toLowerCase();const items=(S.tenders||[]).filter(t=>!q||[t.name,t.owner,t.country,t.counterpart,t.tenor,t.pricing,t.summary].join(\' \').toLowerCase().includes(q));root.innerHTML=items.map(t=>{const ratings=t.assessment||{};const rating=k=>typeof bars===\'function\'?bars(ratings[k]||\'Not assessed\'):esc(ratings[k]||\'Not assessed\');return `<tr data-tender="${esc(t.id)}" tabindex="0" aria-label="Open tender ${esc(t.name)}"><td><button class="textbtn" type="button" data-open-tender="${esc(t.id)}">${typeof flag===\'function\'?flag(t):\'\'} ${esc(t.name)}</button><small>${esc(t.tenor||\'Period not set\')} · ${esc(t.pricing||\'Pricing not set\')}</small></td><td>${typeof badge===\'function\'?badge(t.side||\'Not assessed\'):esc(t.side||\'Not assessed\')} ${esc(t.delivery||\'\')}<small>${esc(t.counterpart||\'Counterpart not set\')}</small><small>${esc(t.country||\'Country not set\')}</small></td><td>${rating(\'strategic\')}</td><td>${rating(\'value\')}</td><td>${rating(\'deliverability\')}</td><td>${esc(t.owner||\'Not assigned\')}</td></tr>`}).join(\'\')||\'<tr><td colspan="6" class="ori24-tender-empty">No matching tenders.</td></tr>\';for(const row of root.querySelectorAll(\'[data-tender]\')){const open=()=>{if(typeof dev21OpenTender===\'function\')dev21OpenTender(row.dataset.tender)};row.onclick=e=>{if(e.target.closest(\'button\'))return;open()};row.onkeydown=e=>{if(e.target!==row)return;if(e.key===\'Enter\'||e.key===\' \'){e.preventDefault();open()}};row.querySelector(\'[data-open-tender]\').onclick=open}const count=host.querySelector(\'[data-v24-tender-count]\');if(count)count.textContent=items.length+\' tender\'+(items.length===1?\'\':\'s\')}\nfunction alignTables(){const split=document.querySelector(\'.ori24-split\');if(!split)return;if(matchMedia(\'(max-width:1100px)\').matches){const spacer=split.querySelector(\'[data-v24-table-spacer]\');if(spacer)spacer.style.height=\'0px\';return;}const left=split.children[0],right=split.children[1],spacer=right.querySelector(\'[data-v24-table-spacer]\'),rt=right.querySelector(\'.ori24-tender-wrap\'),lt=left.querySelector(\'table\');if(!spacer||!rt||!lt)return;const target=lt.closest(\'.tablewrap,.table-wrap,.table-container\')||lt;spacer.style.height=\'0px\';const delta=target.getBoundingClientRect().top-rt.getBoundingClientRect().top;spacer.style.height=Math.max(0,Math.round(delta))+\'px\'}\nfunction leadsLayout(){if(typeof route===\'undefined\'||route.page!==\'leads\'||route.ref)return;const split=document.querySelector(\'.dev21-split\');if(!split||split.children.length!==2)return;split.classList.add(\'ori24-split\');const right=split.children[1];if(!right.dataset.ori24Tenders){right.dataset.ori24Tenders=\'1\';const tenders=S.tenders||[];right.innerHTML=`<header class="ori24-tender-head"><h1>Tenders</h1><button type="button" class="primary" data-dev21-write="1" id="ori24AddTender">+ Add tender</button></header><p class="muted">Select a row to view. Standalone tenders stay outside prioritisation and Qualified Leads.</p><div class="ori24-tender-stats"><article><small>Total tenders</small><strong>${tenders.length}</strong></article><article><small>Buy</small><strong>${tenders.filter(t=>String(t.side).toLowerCase()===\'buy\').length}</strong></article><article><small>Sell</small><strong>${tenders.filter(t=>String(t.side).toLowerCase()===\'sell\').length}</strong></article></div><div class="ori24-tender-search"><input id="ori24TenderQuery" aria-label="Search tenders" placeholder="Search tenders…" value="${esc(V24.query)}"></div><div data-v24-table-spacer></div><div class="ori24-tender-wrap"><table class="ori24-tender-table"><thead><tr><th>Tender / concept</th><th>Terms / country</th><th>Strategic fit</th><th>Value</th><th>Deliverability</th><th>Responsible</th></tr></thead><tbody data-v24-tender-rows></tbody></table></div><p class="muted" data-v24-tender-count style="font-size:13px;margin-top:18px"></p>`;right.querySelector(\'#ori24AddTender\').onclick=()=>{if(typeof dev21EditTender===\'function\')dev21EditTender()};right.querySelector(\'#ori24TenderQuery\').oninput=e=>{V24.query=e.target.value;tableRows(right)};tableRows(right)}requestAnimationFrame(alignTables);if(typeof oriModeControls===\'function\')oriModeControls()}\nfunction insightLayout(){if(typeof route===\'undefined\'||route.ref||![\'insights\',\'intelligence\',\'ideas\'].includes(route.page))return;const page=document.getElementById(\'page\');if(!page)return;page.querySelector(\'.v15-input-columns\')?.classList.add(\'ori24-input-columns\');const candidates=[...page.querySelectorAll(\'.wf-entry,.v15-input-item\')].filter(el=>!el.closest(\'#iiOverlay,.ii-card,.ori24-insight-card\'));const parents=new Set(candidates.map(el=>el.parentElement));for(const parent of parents){const cards=[...parent.children].filter(el=>el.matches(\'.wf-entry,.v15-input-item\'));if(!cards.length)continue;const groups=[];let run=[];for(const child of [...parent.children]){if(cards.includes(child))run.push(child);else if(run.length){groups.push(run);run=[]}}if(run.length)groups.push(run);for(const group of groups){const grid=document.createElement(\'div\');grid.className=\'ori24-insight-grid\';group[0].before(grid);for(const card of group){card.classList.add(\'ori24-insight-card\');grid.appendChild(card);for(const b of card.querySelectorAll(\'button\'))if(/\\bopenRecord\\s*\\(/.test(b.getAttribute(\'onclick\')||\'\'))b.type=\'button\';const paragraphs=[...card.querySelectorAll(\':scope > div > p,:scope > p,:scope > div > small\')].filter(p=>p.textContent.trim().length>420&&!p.closest(\'details\'));for(const p of paragraphs){if(p.dataset.ori24Folded)continue;p.dataset.ori24Folded=\'1\';const details=document.createElement(\'details\');details.className=\'ori24-card-more\';const summary=document.createElement(\'summary\');summary.textContent=\'Read full text\';const preview=document.createElement(\'p\');preview.className=\'muted\';preview.textContent=p.textContent.trim().slice(0,240).replace(/\\s+\\S*$/,\'\')+\'…\';p.before(preview,details);details.append(summary,p);details.addEventListener(\'toggle\',()=>{preview.hidden=details.open})}}}}}\nfunction profileTabs(){if(typeof route===\'undefined\'||route.page!==\'counterparts\'||typeof XDEV===\'undefined\'||!XDEV.cp)return;const page=document.getElementById(\'page\');if(!page||page.querySelector(\'.ori24-profile-tabs\'))return;const sections=[...page.children].filter(el=>el.matches(\'section.panel,.panel\'));if(!sections.length)return;const find=title=>sections.find(s=>{const h=s.querySelector(\'h2\');return h&&h.textContent.trim().toLowerCase()===title.toLowerCase()});const insights=find(\'Insights and Potential\'),facts=find(\'Key Facts\');if(!insights||!facts)return;const id=XDEV.cp;if(V24.cpId!==id){V24.cpId=id;V24.cpTab=\'Overview\'}const tabs=document.createElement(\'div\');tabs.className=\'ori24-profile-tabs\';tabs.setAttribute(\'role\',\'tablist\');tabs.setAttribute(\'aria-label\',\'Counterpart profile sections\');const panels={};for(const [i,name]of [\'Overview\',\'Insights and Potential\',\'Key Facts\'].entries()){const panel=document.createElement(\'div\');panel.className=\'ori24-profile-panel\';panel.id=\'ori24-profile-panel-\'+i;panel.setAttribute(\'role\',\'tabpanel\');panel.setAttribute(\'aria-labelledby\',\'ori24-profile-tab-\'+i);panel.tabIndex=0;panels[name]=panel;const button=document.createElement(\'button\');button.type=\'button\';button.id=\'ori24-profile-tab-\'+i;button.textContent=name;button.setAttribute(\'role\',\'tab\');button.setAttribute(\'aria-controls\',panel.id);button.onclick=()=>select(name);button.onkeydown=e=>{const buttons=[...tabs.children];let target=null;if(e.key===\'ArrowRight\')target=buttons[(i+1)%buttons.length];if(e.key===\'ArrowLeft\')target=buttons[(i+buttons.length-1)%buttons.length];if(e.key===\'Home\')target=buttons[0];if(e.key===\'End\')target=buttons.at(-1);if(target){e.preventDefault();target.click();target.focus()}};tabs.appendChild(button)}const first=sections[0];first.before(tabs);for(const name of [\'Overview\',\'Insights and Potential\',\'Key Facts\'])tabs.parentElement.appendChild(panels[name]);for(const section of sections)panels[section===insights?\'Insights and Potential\':section===facts?\'Key Facts\':\'Overview\'].appendChild(section);function select(name){V24.cpTab=name;for(const [key,panel]of Object.entries(panels))panel.hidden=key!==name;for(const button of tabs.children){const selected=button.textContent===name;button.setAttribute(\'aria-selected\',String(selected));button.tabIndex=selected?0:-1}}select(V24.cpTab in panels?V24.cpTab:\'Overview\');if(typeof oriModeControls===\'function\')oriModeControls()}\nfunction clusterSize(section){const cards=[...section.querySelectorAll(\'.x-cp-card\')];const rings=[];let offset=0;for(let ring=0;offset<cards.length;ring++){const radius=152+ring*132;const capacity=Math.max(6,Math.floor(2*Math.PI*radius/145));const count=Math.min(capacity,cards.length-offset);rings.push({radius,count,offset});offset+=count}const radius=rings.at(-1)?.radius||152;return {cards,rings,size:Math.ceil((radius+100)*2)}}\nfunction arrangeCluster(section){const info=clusterSize(section),size=info.size,center=size/2;section.style.width=size+\'px\';section.style.height=size+\'px\';section.style.minHeight=\'0px\';const bubbles=section.querySelector(\'.x-bubbles\');if(bubbles){bubbles.style.height=size+\'px\';bubbles.style.width=size+\'px\'}const hub=section.querySelector(\'h2\');if(hub){hub.style.left=\'50%\';hub.style.top=\'50%\'}const wires=[];for(const ring of info.rings)for(let i=0;i<ring.count;i++){const card=info.cards[ring.offset+i],angle=-Math.PI/2+2*Math.PI*i/ring.count+(ring.offset?Math.PI/ring.count:0),x=center+ring.radius*Math.cos(angle),y=center+ring.radius*Math.sin(angle);card.style.left=x+\'px\';card.style.top=y+\'px\';wires.push(`<line x1="${center}" y1="${center}" x2="${x}" y2="${y}"/>`)}section.querySelectorAll(\'.dev21-wire\').forEach(el=>el.remove());section.insertAdjacentHTML(\'afterbegin\',`<svg class="dev21-wire" aria-hidden="true" viewBox="0 0 ${size} ${size}">${wires.join(\'\')}</svg>`);return size}\nfunction visualSize(section){return section.offsetWidth*(Number(section.dataset.v24Scale)||1)}\nfunction growCanvas(canvas){let bottom=600;for(const section of canvas.querySelectorAll(\':scope > .dev21-region\'))bottom=Math.max(bottom,parseFloat(section.style.top||\'0\')+visualSize(section)+20);canvas.style.height=Math.ceil(bottom)+\'px\'}\nfunction setPosition(section,x,y,remember){const canvas=section.parentElement,maxX=Math.max(0,canvas.clientWidth-visualSize(section));x=Math.max(0,Math.min(maxX,Number(x)||0));y=Math.max(0,Number(y)||0);section.style.left=Math.round(x)+\'px\';section.style.top=Math.round(y)+\'px\';if(remember){V24.positions[section.dataset.regionKey]={x:Math.round(x),y:Math.round(y)};savePositions()}growCanvas(canvas)}\nfunction defaultPositions(canvas,restore=true){const sections=[...canvas.querySelectorAll(\':scope > .dev21-region\')];const width=Math.max(canvas.clientWidth,360);let x=0,y=0,rowHeight=0;for(const [i,section]of sections.entries()){const scale=width<800?Math.max(.58,Math.min(.8,(width-10)/section.offsetWidth)):width<1450?.82:1;section.dataset.v24Scale=String(scale);section.style.transform=\'scale(\'+scale+\')\';section.style.transformOrigin=\'top left\';const size=visualSize(section);if(x&&x+size>width){x=0;y+=rowHeight+15;rowHeight=0}const saved=restore?V24.positions[section.dataset.regionKey]:null;const offset=i%2===1?28:0;if(saved&&Number.isFinite(saved.x)&&Number.isFinite(saved.y))setPosition(section,saved.x,saved.y,false);else setPosition(section,x,y+offset,false);x+=size+12;rowHeight=Math.max(rowHeight,size+offset)}growCanvas(canvas)}\nfunction enableDrag(section){const hub=section.querySelector(\'h2\');if(!hub)return;hub.tabIndex=0;hub.setAttribute(\'role\',\'button\');hub.setAttribute(\'aria-label\',section.dataset.regionKey+\' cluster. Drag to move. Use arrow keys to move, Shift for larger steps.\');hub.title=\'Drag this region to move its cluster. Arrow keys also move it.\';let drag=null;hub.addEventListener(\'pointerdown\',e=>{if(e.button!==0)return;drag={id:e.pointerId,x:e.clientX,y:e.clientY,left:parseFloat(section.style.left)||0,top:parseFloat(section.style.top)||0,moved:false};section.style.zIndex=\'20\';hub.setPointerCapture(e.pointerId);e.preventDefault()});hub.addEventListener(\'pointermove\',e=>{if(!drag||e.pointerId!==drag.id)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.abs(dx)+Math.abs(dy)>4)drag.moved=true;if(drag.moved)setPosition(section,drag.left+dx,drag.top+dy,false)});const finish=e=>{if(!drag||e.pointerId!==drag.id)return;if(drag.moved)setPosition(section,parseFloat(section.style.left),parseFloat(section.style.top),true);drag=null;section.style.zIndex=\'\';try{hub.releasePointerCapture(e.pointerId)}catch{}};hub.addEventListener(\'pointerup\',finish);hub.addEventListener(\'pointercancel\',finish);hub.addEventListener(\'keydown\',e=>{const step=e.shiftKey?50:15;const dx=e.key===\'ArrowLeft\'?-step:e.key===\'ArrowRight\'?step:0,dy=e.key===\'ArrowUp\'?-step:e.key===\'ArrowDown\'?step:0;if(dx||dy){e.preventDefault();setPosition(section,(parseFloat(section.style.left)||0)+dx,(parseFloat(section.style.top)||0)+dy,true)}})}\nfunction counterpartClusters(){if(typeof route===\'undefined\'||route.page!==\'counterparts\'||typeof XDEV===\'undefined\'||XDEV.cp)return;const page=document.getElementById(\'page\');if(!page||page.querySelector(\'.ori24-cluster-canvas\'))return;const sections=[...page.querySelectorAll(\'.dev21-region\')];if(!sections.length)return;const toolbar=document.createElement(\'div\');toolbar.className=\'ori24-cluster-toolbar\';toolbar.innerHTML=\'<p>Drag a region bubble to move its cluster. Arrow keys move a focused region. Positions are saved in this browser only.</p><button type="button">Reset cluster layout</button>\';const canvas=document.createElement(\'div\');canvas.className=\'ori24-cluster-canvas\';canvas.setAttribute(\'aria-label\',\'Movable regional counterpart clusters\');sections[0].before(toolbar,canvas);for(const section of sections){const heading=section.querySelector(\'h2\');section.dataset.regionKey=(heading?.childNodes[0]?.textContent||heading?.textContent||\'Region\').trim();canvas.appendChild(section);arrangeCluster(section);enableDrag(section)}V24.canvas=canvas;defaultPositions(canvas);toolbar.querySelector(\'button\').onclick=()=>{V24.positions={};savePositions();defaultPositions(canvas,false)};if(V24.resize)V24.resize.disconnect();if(typeof ResizeObserver===\'function\'){let lastWidth=canvas.clientWidth;V24.resize=new ResizeObserver(()=>{if(!canvas.isConnected)return;const width=canvas.clientWidth;if(Math.abs(width-lastWidth)>2){lastWidth=width;defaultPositions(canvas)}});V24.resize.observe(canvas)}}\nfunction apply(){if(V24.applying||typeof S===\'undefined\'||!S)return;V24.applying=true;try{leadsLayout();insightLayout();counterpartClusters();profileTabs()}finally{V24.applying=false}}\nif(typeof wfRenderInsights===\'function\'){const previous=wfRenderInsights;wfRenderInsights=function(...args){const result=previous.apply(this,args);insightLayout();if(typeof iiAttach===\'function\')iiAttach();if(typeof oriModeControls===\'function\')oriModeControls();return result}}\nif(typeof render===\'function\'){const previous=render;render=function(...args){const result=previous.apply(this,args);apply();return result}}\nif(typeof xrenderCP===\'function\'){const previous=xrenderCP;xrenderCP=function(...args){const result=previous.apply(this,args);counterpartClusters();profileTabs();return result}}\nif(typeof xdetailCP===\'function\'){const previous=xdetailCP;xdetailCP=function(...args){const result=previous.apply(this,args);profileTabs();return result}}\nwindow.addEventListener(\'resize\',()=>{requestAnimationFrame(alignTables)});apply();\n})();\n</script>\n'
 HTML=HTML.replace('</body>',_ORI_DEV24_LAYOUT_UI+'</body>')
+
+# Azure storage snapshot UI and API. Added after all existing Handler wrappers so no
+# existing routes or features are replaced.
+_STORAGE_PREVIOUS_GET=Handler.do_GET
+_STORAGE_PREVIOUS_POST=Handler.do_POST
+
+def _storage_api_get(self):
+    path=urlparse(self.path).path
+    if path!='/api/storage/backups':return _STORAGE_PREVIOUS_GET(self)
+    try:
+        if not self.host_ok():self.send(403,{'error':'Invalid host'});return
+        self.send(200,{'backups':storage_list_snapshots()})
+    except Exception as exc:self.send(400,{'error':str(exc)})
+
+def _storage_api_post(self):
+    path=urlparse(self.path).path
+    if path not in ('/api/storage/send','/api/storage/restore'):return _STORAGE_PREVIOUS_POST(self)
+    try:
+        if not self.host_ok() or self.headers.get('X-ORI-Token')!=TOKEN:raise ValueError('Reload the app: invalid request token')
+        if not self.origin_ok(self.headers.get('Origin')):raise ValueError('Cross-origin write rejected')
+        if 'application/json' not in self.headers.get('Content-Type',''):raise ValueError('Expected JSON')
+        length=int(self.headers.get('Content-Length','0'))
+        if not 0<length<1_000_000:raise ValueError('Request too large')
+        body=json.loads(self.rfile.read(length))
+        if path=='/api/storage/send':
+            current=state()
+            if body.get('revision')!=current.get('revision'):self.send(409,{'error':'Workspace changed. Reload before sending to storage.'});return
+            self.send(200,storage_send_snapshot());return
+        result=storage_restore_snapshot(body.get('snapshot_id'))
+        self.send(200,result)
+    except Exception as exc:self.send(400,{'error':str(exc)})
+
+Handler.do_GET=_storage_api_get
+Handler.do_POST=_storage_api_post
+
+_STORAGE_UI=r'''<script>
+async function sendToStorage(){
+  if(dirty||matrixDirty){toast('Save or discard unsaved changes first.');return}
+  if(!confirm('Send the full workspace, pricing snapshot and uploaded files to Azure storage?'))return;
+  try{
+    const result=await api('/api/storage/send',{revision:S.revision});
+    toast('Stored version '+result.snapshot_id+'.');
+    if(route.page==='settings')await storageRefreshVersions();
+  }catch(e){toast(e.message)}
+}
+async function storageRefreshVersions(){
+  const select=$('storageVersionSelect'),status=$('storageVersionStatus');
+  if(!select)return;
+  select.disabled=true;status.textContent='Loading stored versions...';
+  try{
+    const result=await api('/api/storage/backups');
+    const versions=result.backups||[];
+    select.innerHTML=versions.length
+      ? versions.map(v=>`<option value="${E(v.snapshot_id)}">${E(v.snapshot_id)} · revision ${E(v.workspace_revision??'unknown')} · ${E(v.document_count??0)} file(s)</option>`).join('')
+      : '<option value="">No stored versions found</option>';
+    select.disabled=!versions.length;
+    $('storageRestoreButton').disabled=!versions.length;
+    status.textContent=versions.length?`${versions.length} stored version(s) available.`:'No stored versions found.';
+  }catch(e){status.textContent=e.message;toast(e.message)}
+}
+async function storageRestoreSelected(){
+  const select=$('storageVersionSelect');
+  if(!select?.value)return;
+  if(dirty||matrixDirty){toast('Save or discard unsaved changes first.');return}
+  if(!confirm(`Replace the current workspace and uploaded files with stored version ${select.value}? The current local workspace will be retained as a pre-restore recovery file.`))return;
+  try{
+    const result=await api('/api/storage/restore',{snapshot_id:select.value});
+    S=result.state;route={page:'overview',ref:null,tab:'Overview'};cargoSelection=null;matrixDraft=null;render();
+    toast(`Restored ${result.snapshot_id} with ${result.documents_restored} file(s).`);
+  }catch(e){toast(e.message)}
+}
+const _storageOriginalSettings=settings;
+settings=function(){
+  _storageOriginalSettings();
+  const heading=[...document.querySelectorAll('#page h3')].find(x=>x.textContent.trim()==='Data files');
+  if(!heading)return;
+  let node=heading.nextElementSibling;
+  while(node&&node.tagName!=='H3'){const next=node.nextElementSibling;node.remove();node=next}
+  heading.textContent='Azure storage versions';
+  heading.insertAdjacentHTML('afterend',`<p>The working app data remains available in the app. Use <strong>Send to storage</strong> to create a dated, complete version in <code>origination/backups</code>, including uploaded files and the pricing snapshot.</p><div class="actions"><button class="primary" onclick="sendToStorage()">Send to storage</button><button onclick="storageRefreshVersions()">Refresh versions</button></div><label for="storageVersionSelect" style="margin-top:15px">Previous stored version</label><select id="storageVersionSelect" style="width:100%" disabled><option>Loading stored versions...</option></select><div class="actions" style="margin-top:12px"><button id="storageRestoreButton" onclick="storageRestoreSelected()" disabled>Get previous version</button></div><p id="storageVersionStatus" class="muted">Loading stored versions...</p>`);
+  storageRefreshVersions();
+};
+</script>'''
+HTML=HTML.replace('<button onclick="backup()">↓ Backup</button>','<button onclick="sendToStorage()">☁ Send to storage</button>')
+HTML=HTML.replace('Settings & Backup','Settings & storage')
+HTML=HTML.replace('</body>',_STORAGE_UI+'</body>')
 
 if __name__=='__main__':main()
 
