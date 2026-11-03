@@ -3,3 +3,6 @@ microsoft-agents-copilotstudio-client==1.9.0
 reportlab>=4,<5
 tzdata
 pypdf
+azure-identity
+azure-storage-file-datalake
+python-dotenv
