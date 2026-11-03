@@ -35,6 +35,8 @@ Optional workbook import dependency: python -m pip install openpyxl
 No authentication, shared-user synchronisation or live market data connection.
 Country denotes opportunity geography, not any person's nationality.
 """
+import hmac as _request_hmac
+import hashlib as _request_hashlib
 import base64,copy,datetime as dt,io,json,math,os,secrets,threading,uuid,webbrowser,zipfile,shutil,tempfile,re,time
 from azure.identity import ClientSecretCredential
 from azure.storage.blob import BlobServiceClient
@@ -62,6 +64,25 @@ AZURE_STORAGE_ACCOUNT_NAME=os.getenv('AZURE_STORAGE_ACCOUNT_NAME','gplngplabqizr
 AZURE_STORAGE_CONTAINER_NAME=os.getenv('AZURE_STORAGE_CONTAINER_NAME','landingzone').strip()
 AZURE_STORAGE_BASE_DIRECTORY=os.getenv('AZURE_STORAGE_BASE_DIRECTORY','origination').strip('/')
 AZURE_STORAGE_BACKUP_DIRECTORY='backups'
+
+# All replicas must share this key. Prefer a dedicated Radix secret; the existing
+# Storage client secret provides a compatible default without YAML changes.
+_REQUEST_SIGNING_KEY=(os.getenv('ORI_REQUEST_SIGNING_KEY') or AZURE_CLIENT_SECRET or TOKEN).encode('utf-8')
+def _issue_request_token():
+    nonce=secrets.token_urlsafe(32)
+    signature=_request_hmac.new(_REQUEST_SIGNING_KEY,('ori-csrf-v1:'+nonce).encode('ascii'),_request_hashlib.sha256).hexdigest()
+    return 'v1.'+nonce+'.'+signature
+
+def _valid_request_token(value):
+    try:
+        version,nonce,signature=str(value or '').split('.')
+        if version!='v1' or not 20<=len(nonce)<=100:return False
+        expected=_request_hmac.new(_REQUEST_SIGNING_KEY,('ori-csrf-v1:'+nonce).encode('ascii'),_request_hashlib.sha256).hexdigest()
+        return _request_hmac.compare_digest(expected,signature)
+    except (ValueError,TypeError,UnicodeError):return False
+
+TOKEN=_issue_request_token()
+
 _STORAGE_CREDENTIAL=None
 _BLOB_CONTAINER=None
 
@@ -422,7 +443,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:self.send(400,{'error':str(e)})
     def do_POST(self):
         try:
-            if not self.host_ok() or self.headers.get('X-ORI-Token')!=TOKEN:raise ValueError('Reload the app: invalid request token')
+            if not self.host_ok() or not _valid_request_token(self.headers.get('X-ORI-Token')):raise ValueError('Reload the app: invalid request token')
             origin=self.headers.get('Origin')
             if not self.origin_ok(origin):raise ValueError('Cross-origin write rejected')
             if 'application/json' not in self.headers.get('Content-Type',''):raise ValueError('Expected JSON')
@@ -774,7 +795,7 @@ def _ori_copilot_post(handler):
         handler.send(503, {'error': 'Copilot is disabled in this environment.'}); return
     if not handler.host_ok():
         handler.send(403, {'error': 'Chat request host is not allowed. Check the dev ALLOWED_HOSTS configuration.'}); return
-    if handler.headers.get('X-ORI-Token') != TOKEN:
+    if not _valid_request_token(handler.headers.get('X-ORI-Token')):
         handler.send(403, {'error': 'Workspace request token mismatch. Refresh the page with Ctrl+Shift+R. If repeated, check that dev has exactly one replica and no rolling deployment is active.'}); return
     if not handler.origin_ok(handler.headers.get('Origin')):
         handler.send(403, {'error': 'Chat request origin is not allowed. Open the configured dev app address directly, not through another domain.'}); return
@@ -987,7 +1008,7 @@ def _ext_get(self):
 def _ext_post(self):
     if urlparse(self.path).path!='/api/documents/upload':return _EXT_POST(self)
     try:
-        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or self.headers.get('X-ORI-Token')!=TOKEN:self.send(403,{'error':'Invalid request'});return
+        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or not _valid_request_token(self.headers.get('X-ORI-Token')):self.send(403,{'error':'Invalid request'});return
         length=int(self.headers.get('Content-Length','0'))
         if not 0<length<16_000_000:raise ValueError('Maximum upload is 10 MB')
         body=json.loads(self.rfile.read(length));raw=base64.b64decode(body.get('content',''),validate=True)
@@ -1237,7 +1258,7 @@ def _dev_post(self):
         try:_auth_require(self,READ_ROLES)
         except PermissionError as exc:self.send(403,{'error':str(exc)});return
         return _DEV_PREVIOUS_POST(self)
-    if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or self.headers.get('X-ORI-Token')!=TOKEN:
+    if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or not _valid_request_token(self.headers.get('X-ORI-Token')):
         self.send(403,{'error':'Invalid request. Reload the app.'});return
     required=ADMIN_ROLES if path=='/api/storage/restore' else WRITE_ROLES
     try:_auth_require(self,required)
@@ -1565,7 +1586,7 @@ def _ii_post(self):
     path=urlparse(self.path).path
     if not path.startswith('/api/insight-import/'):return _II_OLD_POST(self)
     try:
-        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or self.headers.get('X-ORI-Token')!=TOKEN:self.send(403,{'error':'Invalid import request. Refresh the page.'});return
+        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or not _valid_request_token(self.headers.get('X-ORI-Token')):self.send(403,{'error':'Invalid import request. Refresh the page.'});return
         try:_auth_require(self,WRITE_ROLES)
         except PermissionError as exc:self.send(403,{'error':str(exc),'read_only':True});return
         identity=_auth_identity(self);owner=identity.get('email') or identity.get('name') or 'authenticated-user'
@@ -1957,7 +1978,7 @@ def _storage_api_post(self):
     path=urlparse(self.path).path
     if path not in ('/api/storage/send','/api/storage/restore'):return _STORAGE_PREVIOUS_POST(self)
     try:
-        if not self.host_ok() or self.headers.get('X-ORI-Token')!=TOKEN:raise ValueError('Reload the app: invalid request token')
+        if not self.host_ok() or not _valid_request_token(self.headers.get('X-ORI-Token')):raise ValueError('Reload the app: invalid request token')
         if not self.origin_ok(self.headers.get('Origin')):raise ValueError('Cross-origin write rejected')
         if 'application/json' not in self.headers.get('Content-Type',''):raise ValueError('Expected JSON')
         length=int(self.headers.get('Content-Length','0'))
@@ -2028,28 +2049,54 @@ HTML=HTML.replace('</body>',_STORAGE_UI+'</body>')
 
 # DEV25 general UX additions: dark default, explicit qualification, compact
 # prioritisation facts, portfolio preview, and lightweight rich-text formatting.
-_DEV25_UI=r"""
-<style>
-.dev25-facts{display:flex;flex-wrap:wrap;gap:6px 12px;margin:7px 0 13px;padding:8px 10px;border:1px solid color-mix(in srgb,var(--green) 55%,var(--line));border-radius:9px;background:color-mix(in srgb,var(--green) 12%,var(--panel));color:var(--green);font-size:12px;font-weight:650}
-.dev25-facts span{white-space:nowrap}.dev25-portfolio-btn{margin:0 0 12px}.dev25-portfolio-dialog{width:min(1200px,96vw);max-height:92vh;overflow:auto}.dev25-qual-dialog{width:min(560px,94vw)}
-.dev25-richbar{display:flex;gap:5px;flex-wrap:wrap;margin:5px 0}.dev25-richbar button{min-height:30px;padding:3px 9px;font-size:12px}.dev25-rich{min-height:110px;width:100%;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);overflow:auto;white-space:pre-wrap}.dev25-highlight{background:#fff19a;color:#17202a}.dev25-modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:16px}
-</style>
-<script>
-function dev25Field(x,names){for(const name of names){const v=x?.[name];if(v!==undefined&&v!==null&&String(v).trim()!=='')return v}return ''}
-function dev25LeadFacts(x){if(!x)return '';const side=dev25Field(x,['side'])||'Not set',delivery=dev25Field(x,['delivery','delivery_term','incoterm','fob_des'])||'Not set',formula=dev25Field(x,['pricing_formula','price_formula','formula','indexation'])||'Not set',tenor=dev25Field(x,['tenor','number_of_years'])||'Not set',cargo=dev25Field(x,['number_of_cargoes','total_cargoes'])||'Not set';return `<div class="dev25-facts"><span>Buy/Sell: ${E(side)}</span><span>FOB/DES: ${E(delivery)}</span><span>Pricing: ${E(formula)}</span><span>Tenor: ${E(tenor)}</span><span>Total cargoes: ${E(cargo)}</span></div>`}
-function dev25OpenQualification(){if(!matrixId||!matrixDraft)return;const x=S.records.find(r=>r.id===matrixId);if(!x)return;const old=x.qualification||{};const host=document.createElement('div');host.className='modal open';host.innerHTML=`<div class="dialog dev25-qual-dialog"><div class="dialoghead"><div><h2>Save rating for ${E(x.name)}</h2><small>A rating does not qualify the lead unless explicitly verified.</small></div></div>${dev25LeadFacts(x)}<label for="dev25QualDate">Qualification date</label><input id="dev25QualDate" type="date" value="${E(old.date||today())}"><label for="dev25QualComment">Comment</label><textarea id="dev25QualComment">${E(old.comment||'')}</textarea><label style="display:flex;gap:8px;align-items:flex-start;margin-top:12px"><input id="dev25QualCheck" type="checkbox" style="width:auto;margin-top:5px" ${old.verified?'checked':''}> I verify that this should be a qualified lead</label><div class="dev25-modal-actions"><button id="dev25Cancel">Cancel</button><button id="dev25RatingOnly">Save rating only</button><button class="primary" id="dev25Qualify">Save and qualify</button></div></div>`;document.body.appendChild(host);const close=()=>host.remove();host.querySelector('#dev25Cancel').onclick=close;host.querySelector('#dev25RatingOnly').onclick=async()=>{await dev25SaveRating(false,'','');close()};host.querySelector('#dev25Qualify').onclick=async()=>{const checked=host.querySelector('#dev25QualCheck').checked,date=host.querySelector('#dev25QualDate').value,comment=host.querySelector('#dev25QualComment').value;if(!checked){toast('Tick the verification box to qualify this lead.');return}if(!date){toast('Qualification date is required.');return}await dev25SaveRating(true,date,comment);close()}}
-async function dev25SaveRating(verified,date,comment){if(!matrixDraft||matrixMove||saving)return;try{const n=copy(S),x=n.records.find(r=>r.id===matrixId);x.priority=copy(matrixDraft);x.qualification={verified:!!verified,date:verified?date:'',comment:verified?comment:'',verified_at:verified?new Date().toISOString():'',verified_by:verified?(ORI_MODE.identity?.email||ORI_MODE.identity?.name||'Authenticated user'):''};await commit(n);matrixDirty=false;matrix();toast(verified?'Ratings saved and lead qualified.':'Ratings saved without qualifying the lead.')}catch(e){toast(e.message)}}
-const dev25OriginalSaveMatrix=saveMatrix;saveMatrix=function(){dev25OpenQualification()};
-function dev25PortfolioModal(){if(!matrixId)return;const lead=S.records.find(x=>x.id===matrixId);if(!lead)return;const host=document.createElement('div');host.className='modal open';host.innerHTML=`<div class="dialog dev25-portfolio-dialog"><div class="dialoghead"><div><h2>Portfolio overview: ${E(lead.name)}</h2><small>Use Include/Exclude to test this lead in the existing portfolio view.</small></div><button id="dev25ClosePortfolio">Close</button></div><div id="dev25PortfolioBody"></div></div>`;document.body.appendChild(host);host.querySelector('#dev25ClosePortfolio').onclick=()=>{host.remove();render()};const originalPage=route.page,originalRef=route.ref,originalTab=route.tab;route.page='portfolio';route.ref=null;route.tab='Overview';portfolio();const rendered=$('page').innerHTML;$('page').innerHTML='';route.page=originalPage;route.ref=originalRef;route.tab=originalTab;host.querySelector('#dev25PortfolioBody').innerHTML=`<div class="actions" style="margin:12px 0"><button class="primary" id="dev25Include">Include</button><button id="dev25Exclude">Exclude</button></div>${rendered}`;const apply=(included)=>{lead.portfolio_included=included;const cb=host.querySelector(`#inc_${CSS.escape(lead.id)}`);if(cb){cb.checked=included;cb.dispatchEvent(new Event('change',{bubbles:true}))}toast(`${lead.name} ${included?'included in':'excluded from'} this portfolio view.`)};host.querySelector('#dev25Include').onclick=()=>apply(true);host.querySelector('#dev25Exclude').onclick=()=>apply(false)}
-// Decorate each normal matrix render once. Do not call matrix() from a DOM observer.
-const dev25Matrix=matrix;matrix=function(){dev25Matrix();if(!matrixId)return;const x=S.records.find(r=>r.id===matrixId),editor=document.querySelector('#matrixPlot')?.closest('.panel')?.nextElementSibling;if(!x||!editor)return;const h=editor.querySelector('h2');if(h&&!editor.querySelector('.dev25-facts'))h.insertAdjacentHTML('afterend',dev25LeadFacts(x));if(!editor.querySelector('.dev25-portfolio-btn'))editor.insertAdjacentHTML('afterbegin','<button class="dev25-portfolio-btn" onclick="dev25PortfolioModal()">View in Portfolio Overview</button>');oriModeControls()};
-function dev25RichCommand(el,cmd,value=null){el.focus();document.execCommand(cmd,false,value)}
-function dev25EnhanceRichText(root=document){for(const ta of root.querySelectorAll('textarea:not([data-dev25-rich])')){if(ta.closest('.ii-source-panel')||ta.id==='dev25QualComment')continue;ta.dataset.dev25Rich='1';const wrap=document.createElement('div'),bar=document.createElement('div'),edit=document.createElement('div');bar.className='dev25-richbar';edit.className='dev25-rich';edit.contentEditable=String(!ta.disabled);edit.innerHTML=E(ta.value).replace(/\n/g,'<br>');bar.innerHTML='<button type="button">• List</button><button type="button"><u>Underline</u></button><button type="button"><span class="dev25-highlight">Highlight</span></button>';ta.before(wrap);wrap.append(bar,edit);ta.hidden=true;bar.children[0].onclick=()=>dev25RichCommand(edit,'insertUnorderedList');bar.children[1].onclick=()=>dev25RichCommand(edit,'underline');bar.children[2].onclick=()=>dev25RichCommand(edit,'hiliteColor','#fff19a');const sync=()=>{ta.value=edit.innerHTML;ta.dispatchEvent(new Event('input',{bubbles:true}));ta.dispatchEvent(new Event('change',{bubbles:true}))};edit.addEventListener('input',sync);edit.addEventListener('blur',sync)}}
-let dev25Pending=false;new MutationObserver(()=>{if(dev25Pending)return;dev25Pending=true;requestAnimationFrame(()=>{dev25Pending=false;dev25EnhanceRichText();oriModeControls()})}).observe(document.body,{childList:true,subtree:true});
-dev25EnhanceRichText();
-</script>
-"""
+_DEV25_UI='\n<style>\n.dev25-facts{display:flex;flex-wrap:wrap;gap:6px 12px;margin:7px 0 13px;padding:8px 10px;border:1px solid color-mix(in srgb,var(--green) 55%,var(--line));border-radius:9px;background:color-mix(in srgb,var(--green) 12%,var(--panel));color:var(--green);font-size:12px;font-weight:650}\n.dev25-facts span{white-space:nowrap}.dev25-portfolio-btn{margin:0 0 12px}.dev25-portfolio-dialog{width:min(1200px,96vw);max-height:92vh;overflow:auto}.dev25-qual-dialog{width:min(560px,94vw)}\n.dev25-richbar{display:flex;gap:5px;flex-wrap:wrap;margin:5px 0}.dev25-richbar button{min-height:30px;padding:3px 9px;font-size:12px}.dev25-rich{min-height:110px;width:100%;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);overflow:auto;white-space:pre-wrap}.dev25-highlight{background:#fff19a;color:#17202a}.dev25-modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:16px}\n\n.dev25-qual-dialog,.dev25-portfolio-dialog{box-sizing:border-box;padding:0!important;border:1px solid var(--line);border-radius:16px;background:var(--panel);box-shadow:0 24px 80px #0006;max-height:calc(100dvh - 48px);overflow:auto}\n.dev25-qual-dialog{width:min(620px,calc(100vw - 32px))}\n.dev25-portfolio-dialog{width:min(1280px,calc(100vw - 32px))}\n.dev25-qual-dialog>.dialoghead,.dev25-portfolio-dialog>.dialoghead{padding:22px 24px!important;margin:0!important;border-bottom:1px solid var(--line);align-items:flex-start;gap:18px}\n.dev25-qual-dialog>.dialoghead h2,.dev25-portfolio-dialog>.dialoghead h2{font-size:20px;line-height:1.35;margin:0 0 6px}\n.dev25-qual-dialog>.dialoghead small,.dev25-portfolio-dialog>.dialoghead small{font-size:13px;line-height:1.55;display:block}\n.dev25-qual-body{padding:22px 24px 24px;box-sizing:border-box}\n.dev25-qual-body label{display:block;margin:16px 0 7px;font-weight:600;font-size:13px}\n.dev25-qual-body input[type=date],.dev25-qual-body textarea{box-sizing:border-box;width:100%;max-width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}\n.dev25-qual-body textarea{min-height:110px;resize:vertical}\n.dev25-qual-body .dev25-facts{margin:0 0 18px;line-height:1.6;padding:10px 12px}\n.dev25-qual-body .dev25-verify{display:flex;gap:10px;align-items:flex-start;font-weight:400;line-height:1.55;margin:18px 0}\n.dev25-qual-body .dev25-verify input{flex:0 0 auto;width:16px;height:16px;margin:3px 0 0}\n.dev25-qual-body .dev25-modal-actions{border-top:1px solid var(--line);padding-top:18px;margin-top:20px;gap:10px}\n#dev25PortfolioBody{padding:22px 24px 26px;box-sizing:border-box;min-width:0}\n.dev25-preview-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 22px;padding:12px 14px;background:var(--soft);border:1px solid var(--line);border-radius:10px}\n.dev25-preview-actions small{flex:1 1 180px}\n.dev25-portfolio-dialog .portfolio-layout{min-width:0}.dev25-portfolio-dialog .portfolio-layout>*{min-width:0}\n.bodytext ul,.bodytext ol,.dev25-rich ul,.dev25-rich ol{padding-left:1.6em;margin:.45em 0}.bodytext li,.dev25-rich li{margin:.2em 0}.bodytext p{margin:.4em 0}.bodytext mark,.dev25-rich mark{background:#fff19a;color:#17202a;padding:0 .12em;border-radius:2px}\n.dev25-richbar{padding:6px 8px;margin:0;border:1px solid var(--line);border-bottom:0;border-radius:8px 8px 0 0;background:var(--soft)}\n.dev25-richbar button{background:var(--panel);border-radius:5px;min-width:36px}\n.dev25-rich{box-sizing:border-box;border-radius:0 0 8px 8px;line-height:1.6;outline:none}.dev25-rich:focus{border-color:var(--blue);box-shadow:0 0 0 2px color-mix(in srgb,var(--blue) 20%,transparent)}\n@media(max-width:650px){.dev25-qual-dialog>.dialoghead,.dev25-portfolio-dialog>.dialoghead{padding:18px!important}.dev25-qual-body,#dev25PortfolioBody{padding:18px}.dev25-modal-actions button{flex:1 1 auto}}\n</style>\n<script>\nfunction dev25Field(x,names){for(const name of names){const v=x?.[name];if(v!==undefined&&v!==null&&String(v).trim()!==\'\')return v}return \'\'}\nfunction dev25LeadFacts(x){if(!x)return \'\';const side=dev25Field(x,[\'side\'])||\'Not set\',delivery=dev25Field(x,[\'delivery\',\'delivery_term\',\'incoterm\',\'fob_des\'])||\'Not set\',formula=dev25Field(x,[\'pricing_formula\',\'price_formula\',\'formula\',\'indexation\'])||\'Not set\',tenor=dev25Field(x,[\'tenor\',\'number_of_years\'])||\'Not set\',cargo=dev25Field(x,[\'number_of_cargoes\',\'total_cargoes\'])||\'Not set\';return `<div class="dev25-facts"><span>Buy/Sell: ${E(side)}</span><span>FOB/DES: ${E(delivery)}</span><span>Pricing: ${E(formula)}</span><span>Tenor: ${E(tenor)}</span><span>Total cargoes: ${E(cargo)}</span></div>`}\nfunction dev25OpenQualification(){\n if(!matrixId||!matrixDraft||saving)return;\n if(!oriModeCanWrite()){toast(\'Writer or Administrator access is required.\');return}\n const x=S.records.find(r=>r.id===matrixId);if(!x)return;\n const old=x.qualification||{},host=document.createElement(\'div\');host.className=\'modal open\';\n host.setAttribute(\'role\',\'dialog\');host.setAttribute(\'aria-modal\',\'true\');host.setAttribute(\'aria-labelledby\',\'dev25QualTitle\');\n host.innerHTML=`<div class="dialog dev25-qual-dialog"><div class="dialoghead"><div><h2 id="dev25QualTitle">Save rating for ${E(x.name)}</h2><small>Save the rating on its own, or verify this lead for Qualified Leads.</small></div></div><div class="dev25-qual-body">${dev25LeadFacts(x)}<label for="dev25QualDate">Qualification date</label><input id="dev25QualDate" type="date" value="${E(old.date||today())}"><label for="dev25QualComment">Comment</label><textarea id="dev25QualComment" placeholder="Add the context for this qualification…">${E(old.comment||\'\')}</textarea><label class="dev25-verify"><input id="dev25QualCheck" type="checkbox" ${old.verified?\'checked\':\'\'}><span>I verify that this should be a qualified lead.</span></label><div class="dev25-modal-actions"><button type="button" id="dev25Cancel">Cancel</button><button type="button" id="dev25RatingOnly">Save rating only</button><button type="button" class="primary" id="dev25Qualify">Save and qualify</button></div></div></div>`;\n document.body.appendChild(host);const previous=document.activeElement;\n const close=()=>{host.remove();previous?.focus()};host.querySelector(\'#dev25Cancel\').onclick=close;\n host.addEventListener(\'keydown\',e=>{if(e.key===\'Escape\'&&!saving)close()});\n const save=async verified=>{\n  const date=host.querySelector(\'#dev25QualDate\').value,comment=host.querySelector(\'#dev25QualComment\').value;\n  if(verified&&!host.querySelector(\'#dev25QualCheck\').checked){toast(\'Tick the verification box to qualify this lead.\');return}\n  if(verified&&!date){toast(\'Qualification date is required.\');return}\n  host.querySelectorAll(\'button\').forEach(b=>b.disabled=true);\n  const ok=await dev25SaveRating(verified,date,comment);\n  if(ok)close();else host.querySelectorAll(\'button\').forEach(b=>b.disabled=false);\n };\n host.querySelector(\'#dev25RatingOnly\').onclick=()=>save(false);host.querySelector(\'#dev25Qualify\').onclick=()=>save(true);\n host.querySelector(\'#dev25QualDate\').focus();\n}\nasync function dev25SaveRating(verified,date,comment){if(!matrixDraft||matrixMove||saving)return false;try{const n=copy(S),x=n.records.find(r=>r.id===matrixId);x.priority=copy(matrixDraft);x.qualification={verified:!!verified,date:verified?date:\'\',comment:verified?comment:\'\',verified_at:verified?new Date().toISOString():\'\',verified_by:verified?(ORI_MODE.identity?.email||ORI_MODE.identity?.name||\'Authenticated user\'):\'\'};await commit(n);matrixDirty=false;matrix();toast(verified?\'Ratings saved and lead qualified.\':\'Ratings saved without qualifying the lead.\');return true}catch(e){toast(e.message);return false}}\nconst dev25OriginalSaveMatrix=saveMatrix;saveMatrix=function(){dev25OpenQualification()};\nlet dev26Preview=null;\nfunction dev25PortfolioModal(){\n if(!matrixId||dev26Preview)return;\n const lead=S.records.find(x=>x.id===matrixId);if(!lead)return;\n const page=$(\'page\'),originalSelection=cargoSelection?new Set(cargoSelection):null;\n const parked=document.createDocumentFragment();while(page.firstChild)parked.appendChild(page.firstChild);\n page.id=\'dev26ParkedPage\';\n const host=document.createElement(\'div\');host.className=\'modal open\';host.setAttribute(\'role\',\'dialog\');host.setAttribute(\'aria-modal\',\'true\');host.setAttribute(\'aria-labelledby\',\'dev26PortfolioTitle\');\n host.innerHTML=`<div class="dialog dev25-portfolio-dialog"><div class="dialoghead"><div><h2 id="dev26PortfolioTitle">Portfolio overview: ${E(lead.name)}</h2><small>Compare the portfolio with and without this lead. Preview selections do not change saved workspace data.</small></div><button type="button" id="dev25ClosePortfolio">Close</button></div><div id="dev25PortfolioBody"><div class="dev25-preview-actions"><small id="dev26PreviewStatus"></small><button type="button" class="primary" id="dev25Include">Include</button><button type="button" id="dev25Exclude">Exclude</button></div><div id="page"></div></div></div>`;\n document.body.appendChild(host);\n cargoSelection=originalSelection?new Set(originalSelection):new Set(S.records.map(x=>x.id));\n const updateStatus=()=>{const included=cargoSelection.has(lead.id);host.querySelector(\'#dev26PreviewStatus\').textContent=lead.name+(included?\' is included in this preview.\':\' is excluded from this preview.\');host.querySelector(\'#dev25Include\').setAttribute(\'aria-pressed\',String(included));host.querySelector(\'#dev25Exclude\').setAttribute(\'aria-pressed\',String(!included))};\n const close=()=>{host.remove();page.id=\'page\';page.appendChild(parked);cargoSelection=originalSelection;dev26Preview=null;oriModeControls()};\n dev26Preview={host,close,updateStatus};host.querySelector(\'#dev25ClosePortfolio\').onclick=close;\n host.addEventListener(\'keydown\',e=>{if(e.key===\'Escape\'){e.stopPropagation();close()}});\n const apply=included=>{if(included)cargoSelection.add(lead.id);else cargoSelection.delete(lead.id);portfolio();updateStatus()};\n host.querySelector(\'#dev25Include\').onclick=()=>apply(true);host.querySelector(\'#dev25Exclude\').onclick=()=>apply(false);\n portfolio();updateStatus();host.querySelector(\'#dev25ClosePortfolio\').focus();\n}\n// Decorate each normal matrix render once. Do not call matrix() from a DOM observer.\nconst dev25Matrix=matrix;matrix=function(){dev25Matrix();if(!matrixId)return;const x=S.records.find(r=>r.id===matrixId),editor=document.querySelector(\'#matrixPlot\')?.closest(\'.panel\')?.nextElementSibling;if(!x||!editor)return;const h=editor.querySelector(\'h2\');if(h&&!editor.querySelector(\'.dev25-facts\'))h.insertAdjacentHTML(\'afterend\',dev25LeadFacts(x));if(!editor.querySelector(\'.dev25-portfolio-btn\'))editor.insertAdjacentHTML(\'afterbegin\',\'<button class="dev25-portfolio-btn" onclick="dev25PortfolioModal()">View in Portfolio Overview</button>\');oriModeControls()};\nfunction dev26HasRich(v){return /<\\/?(?:br|ul|ol|li|u|mark|span|div|p|b|strong|i|em)\\b[^>]*>/i.test(String(v||\'\'))}\nfunction dev26SafeRich(value){\n const template=document.createElement(\'template\');template.innerHTML=String(value||\'\');\n const output=document.createElement(\'div\'),allowed=new Set([\'BR\',\'UL\',\'OL\',\'LI\',\'U\',\'MARK\',\'DIV\',\'P\',\'B\',\'STRONG\',\'I\',\'EM\']);\n const copyNode=(node,parent)=>{\n  if(node.nodeType===Node.TEXT_NODE){parent.appendChild(document.createTextNode(node.textContent));return}\n  if(node.nodeType!==Node.ELEMENT_NODE)return;\n  if([\'SCRIPT\',\'STYLE\',\'IFRAME\',\'OBJECT\',\'EMBED\',\'SVG\',\'MATH\',\'TEMPLATE\',\'FORM\',\'INPUT\',\'BUTTON\',\'IMG\',\'VIDEO\',\'AUDIO\'].includes(node.tagName))return;\n  let tag=node.tagName;\n  if(tag===\'SPAN\'){\n   if(node.style.backgroundColor&&node.style.backgroundColor!==\'transparent\')tag=\'MARK\';\n   else if(node.style.textDecoration.includes(\'underline\')||node.style.textDecorationLine.includes(\'underline\'))tag=\'U\';\n  }\n  const dest=allowed.has(tag)?document.createElement(tag.toLowerCase()):parent;\n  if(dest!==parent)parent.appendChild(dest);\n  for(const child of node.childNodes)copyNode(child,dest);\n };\n for(const child of template.content.childNodes)copyNode(child,output);\n return output.innerHTML;\n}\nconst dev26PlainText=text;\ntext=function(value,fallback=\'Not recorded yet\'){\n if(!value)return dev26PlainText(value,fallback);\n return dev26HasRich(value)?`<div class="bodytext">${dev26SafeRich(value)}</div>`:dev26PlainText(value,fallback);\n};\nfunction dev26RepairDisplay(){\n for(const el of document.querySelectorAll(\'.bodytext\')){\n  if(el.closest(\'[contenteditable],textarea,pre,code\'))continue;\n  if(el.childElementCount===0&&dev26HasRich(el.textContent))el.innerHTML=dev26SafeRich(el.textContent);\n }\n}\nfunction dev25RichCommand(el,cmd,value=null){el.focus();document.execCommand(cmd,false,value);el.dispatchEvent(new Event(\'input\',{bubbles:true}))}\nfunction dev25EnhanceRichText(root=document){\n for(const ta of root.querySelectorAll(\'textarea:not([data-dev25-rich])\')){\n  if(ta.closest(\'.ii-source-panel\')||ta.id===\'dev25QualComment\')continue;\n  ta.dataset.dev25Rich=\'1\';const wrap=document.createElement(\'div\'),bar=document.createElement(\'div\'),edit=document.createElement(\'div\');\n  bar.className=\'dev25-richbar\';edit.className=\'dev25-rich\';edit.contentEditable=String(!ta.disabled&&oriModeCanWrite());edit.setAttribute(\'role\',\'textbox\');edit.setAttribute(\'aria-multiline\',\'true\');\n  edit.setAttribute(\'aria-label\',ta.getAttribute(\'aria-label\')||ta.labels?.[0]?.textContent||ta.placeholder||\'Text\');\n  edit.innerHTML=dev26HasRich(ta.value)?dev26SafeRich(ta.value):E(ta.value).replace(/\\n/g,\'<br>\');\n  bar.innerHTML=\'<button type="button" title="Bullet list">• List</button><button type="button" title="Underline"><u>Underline</u></button><button type="button" title="Highlight"><span class="dev25-highlight">Highlight</span></button>\';\n  ta.before(wrap);wrap.append(bar,edit);ta.hidden=true;\n  const sync=()=>{\n   const clean=dev26SafeRich(edit.innerHTML),formatted=/<(?:ul|ol|li|u|mark|strong|b|i|em)\\b/i.test(clean);\n   ta.value=formatted?clean:edit.innerText;\n   ta.dispatchEvent(new Event(\'input\',{bubbles:true}));ta.dispatchEvent(new Event(\'change\',{bubbles:true}));\n  };\n  bar.querySelectorAll(\'button\').forEach(b=>{b.disabled=!oriModeCanWrite();b.onmousedown=e=>e.preventDefault()});\n  bar.children[0].onclick=()=>dev25RichCommand(edit,\'insertUnorderedList\');bar.children[1].onclick=()=>dev25RichCommand(edit,\'underline\');bar.children[2].onclick=()=>dev25RichCommand(edit,\'hiliteColor\',\'#fff19a\');\n  edit.addEventListener(\'input\',sync);edit.addEventListener(\'blur\',sync);\n  edit.addEventListener(\'paste\',e=>{e.preventDefault();document.execCommand(\'insertText\',false,e.clipboardData.getData(\'text/plain\'));sync()});\n  ta.form?.addEventListener(\'submit\',sync,true);\n }\n dev26RepairDisplay();\n}\nlet dev25Pending=false;new MutationObserver(()=>{if(dev25Pending)return;dev25Pending=true;requestAnimationFrame(()=>{dev25Pending=false;dev25EnhanceRichText();oriModeControls()})}).observe(document.body,{childList:true,subtree:true});\ndev25EnhanceRichText();\n</script>\n'
 HTML=HTML.replace('</body>',_DEV25_UI+'</body>')
+
+# Request-token recovery: safe across replicas using the shared signing key.
+_DEV26_GET=Handler.do_GET
+_DEV26_POST=Handler.do_POST
+
+def _dev26_get(self):
+    if urlparse(self.path).path!='/api/request-token':return _DEV26_GET(self)
+    try:
+        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')):
+            self.send(403,{'error':'Invalid request origin.'});return
+        _auth_require(self,READ_ROLES)
+        self.send(200,{'request_token':_issue_request_token()})
+    except PermissionError:
+        self.send(403,{'error':'Sign in again to refresh your application access.'})
+
+def _dev26_post(self):
+    if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')):
+        self.send(403,{'error':'Invalid request origin.'});return
+    if not _valid_request_token(self.headers.get('X-ORI-Token')):
+        self.send(403,{'error':'Your page security token needs refreshing.','code':'invalid_request_token'});return
+    return _DEV26_POST(self)
+
+Handler.do_GET=_dev26_get
+Handler.do_POST=_dev26_post
+
+_DEV26_REQUEST_UI=r"""<script>
+(()=>{
+ const originalFetch=window.fetch.bind(window);let requestToken=TOKEN,refreshPromise=null;
+ window.fetch=async function(input,init){
+  const url=new URL(typeof input==='string'?input:input.url,location.href),method=String(init?.method||(input instanceof Request?input.method:'GET')).toUpperCase();
+  if(url.origin!==location.origin||!url.pathname.startsWith('/api/')||method==='GET'||method==='HEAD')return originalFetch(input,init);
+  const headers=new Headers(init?.headers||(input instanceof Request?input.headers:undefined));headers.set('X-ORI-Token',requestToken);
+  const options={...init,headers};let response=await originalFetch(input,options);
+  if(response.status!==403)return response;
+  let error;try{error=await response.clone().json()}catch{return response}
+  // Retry only a request explicitly rejected before any handler read or mutation.
+  // Never retry conflicts, permissions, network errors, or a possibly committed save.
+  if(error.code!=='invalid_request_token')return response;
+  if(input instanceof Request)return response;
+  if(!refreshPromise)refreshPromise=originalFetch('/api/request-token',{cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('Please sign in again.');const d=await r.json();requestToken=d.request_token;return requestToken}).finally(()=>{refreshPromise=null});
+  try{await refreshPromise}catch{return response}
+  headers.set('X-ORI-Token',requestToken);return originalFetch(input,{...init,headers});
+ };
+})();
+</script>"""
+HTML=HTML.replace('</body>',_DEV26_REQUEST_UI+'</body>')
 
 if __name__=='__main__':main()
 
