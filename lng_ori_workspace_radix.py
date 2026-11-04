@@ -2640,6 +2640,58 @@ HTML=HTML.replace('</body>',_V30_UI+'</body>')
 # The isolated preview uses the same grouping UI without affecting its parent.
 _V28_PREVIEW_HTML=HTML.replace('<head>','<head>'+_V28_PREVIEW_BOOT,1).replace('</body>',_V28_PREVIEW_END+'</body>')
 
+
+# Optional visual-only keyboard Easter egg. No state, API or storage operations.
+_ORI_PINT_UI=r"""<style>
+#ori-pint-shower{position:fixed;inset:0;z-index:2147483000;overflow:hidden;pointer-events:none!important;user-select:none;contain:strict}
+#ori-pint-shower .ori-pint{position:absolute;top:-100px;display:block;line-height:1;pointer-events:none!important;filter:drop-shadow(0 3px 5px #0003);will-change:transform,opacity;animation:ori-pint-fall var(--pint-duration) linear var(--pint-delay) both}
+@keyframes ori-pint-fall{0%{transform:translate3d(0,-80px,0) rotate(var(--pint-start));opacity:0}8%{opacity:1}85%{opacity:1}100%{transform:translate3d(var(--pint-drift),calc(100vh + 200px),0) rotate(var(--pint-end));opacity:0}}
+#ori-pint-shower.ori-pint-reduced .ori-pint{top:var(--pint-top);animation:ori-pint-gentle 2.4s ease-out both;will-change:opacity}
+@keyframes ori-pint-gentle{0%{opacity:0}15%,75%{opacity:1}100%{opacity:0}}
+</style><script>
+(()=>{
+ 'use strict';
+ // Keep the preview iframe independent: typing in it must not alter its parent.
+ if(window.self!==window.top)return;
+ let buffer='',lastKey=0,cleanupTimer=null;
+ const clear=()=>{document.getElementById('ori-pint-shower')?.remove();if(cleanupTimer!==null)clearTimeout(cleanupTimer);cleanupTimer=null;buffer='';lastKey=0};
+ const show=()=>{
+  clear();
+  const layer=document.createElement('div');layer.id='ori-pint-shower';layer.setAttribute('aria-hidden','true');
+  const reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(reduced)layer.classList.add('ori-pint-reduced');
+  const count=reduced?18:64;
+  for(let i=0;i<count;i++){
+   const pint=document.createElement('span');pint.className='ori-pint';pint.textContent='\u{1F37A}';
+   pint.style.left=(Math.random()*96)+'%';pint.style.fontSize=(28+Math.random()*28)+'px';
+   pint.style.setProperty('--pint-duration',(3.2+Math.random()*1.7)+'s');
+   pint.style.setProperty('--pint-delay',(Math.random()*1.4)+'s');
+   pint.style.setProperty('--pint-drift',(-100+Math.random()*200)+'px');
+   pint.style.setProperty('--pint-start',(-25+Math.random()*50)+'deg');
+   pint.style.setProperty('--pint-end',(-160+Math.random()*320)+'deg');
+   pint.style.setProperty('--pint-top',(8+Math.random()*78)+'vh');
+   layer.appendChild(pint);
+  }
+  document.body.appendChild(layer);cleanupTimer=setTimeout(clear,reduced?2600:6800);
+ };
+ const typing=(event)=>{
+  const path=event.composedPath?event.composedPath():[event.target];
+  return path.some(node=>node instanceof Element&&(node.matches('input,textarea,select,[role="textbox"],[role="combobox"]')||node.isContentEditable));
+ };
+ document.addEventListener('keydown',event=>{
+  if(event.key==='Escape'){clear();return}
+  if(event.defaultPrevented||event.isComposing||event.repeat||event.ctrlKey||event.altKey||event.metaKey||typing(event)){buffer='';return}
+  if(event.key.length!==1||!/^[a-z]$/i.test(event.key)){buffer='';return}
+  const now=performance.now();if(now-lastKey>1800)buffer='';lastKey=now;
+  buffer=(buffer+event.key.toLowerCase()).slice(-4);
+  if(buffer==='pint')show();
+ });
+ window.addEventListener('blur',()=>{buffer='';lastKey=0});
+ window.addEventListener('pagehide',clear);
+})();
+</script>"""
+HTML=HTML.replace('</body>',_ORI_PINT_UI+'</body>')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
