@@ -3358,6 +3358,215 @@ _ORI35_UI='<style>\n#page .ori31-columns{grid-template-columns:repeat(3,minmax(0
 HTML=HTML.replace('</body>',_ORI35_UI+'</body>')
 _V28_PREVIEW_HTML=HTML.replace('<head>','<head>'+_V28_PREVIEW_BOOT,1).replace('</body>',_V28_PREVIEW_END+'</body>')
 
+
+# V36 additive administrator usage analytics.
+# Workspace data, revisioning, permissions and backup formats are not modified.
+# Analytics are stored separately; no IPs, tokens, record IDs or record contents.
+_USAGE36_PREFIX='usage/v36'
+_USAGE36_LOCK=threading.RLock()
+_USAGE36_CACHE={}
+_USAGE36_PAGES={
+ 'overview':'Overview','needs':'Portfolio Needs','insights':'Market Insights and Ideas',
+ 'intelligence':'Market Insights and Ideas','ideas':'Market Insights and Ideas',
+ 'leads':'Leads','current':'Contracts','timeline':'Timeline','matrix':'Prioritisation',
+ 'funnel':'Funnel','portfolio':'Portfolio','values':'Contract Values','pricing':'Pricing',
+ 'settings':'Settings & Backup','counterparts':'Counterparts','tenders':'Tenders',
+ 'qualified':'Qualified Leads','map':'Map','archive':'Archive','assignments':'Assignments','usage':'Usage Analytics',
+ 'record:lead':'Lead / contract details','record:need':'Portfolio need details',
+ 'record:insight':'Market insight details','record:idea':'Idea details',
+ 'record:counterpart':'Counterpart details','record:tender':'Tender details','other':'Other workspace page'}
+
+def _usage36_shared():
+    return bool(AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_CONTAINER_NAME)
+
+def _usage36_local():
+    # Development-only storage. Never silently fall back if configured Azure fails.
+    from pathlib import Path
+    p=Path(DATA).parent/'ori_usage_analytics_v36';p.mkdir(parents=True,exist_ok=True);return p
+
+def _usage36_now():return dt.datetime.now(dt.timezone.utc)
+
+def _usage36_ingest(handler,body):
+    ident=_auth_identity(handler)
+    claims=_auth_claims(handler)
+    subject=str(claims.get('oid') or claims.get('sub') or ident.get('email') or '')
+    if not subject:raise PermissionError('An authenticated user identifier is required.')
+    uid=_request_hashlib.sha256((str(claims.get('tid',''))+'|'+subject).encode()).hexdigest()[:32]
+    session=str(body.get('session',''));view=str(body.get('view',''))
+    if not re.fullmatch(r'[a-zA-Z0-9-]{16,80}',session) or not re.fullmatch(r'[a-zA-Z0-9-]{16,80}',view):raise ValueError('Invalid usage session.')
+    page=str(body.get('page','other'))
+    if page not in _USAGE36_PAGES:page='other'
+    seq=body.get('seq');seconds=body.get('seconds',0)
+    if isinstance(seq,bool) or not isinstance(seq,int) or not 0<=seq<=10000000:raise ValueError('Invalid sequence.')
+    if isinstance(seconds,bool) or not isinstance(seconds,(float,int)) or not math.isfinite(seconds) or not 0<=seconds<=86400:raise ValueError('Invalid active duration.')
+    now=_usage36_now();stamp=now.isoformat();day=now.strftime('%Y/%m/%d')
+    relative=f'{_USAGE36_PREFIX}/sessions/{day}/{uid}/{session}.json'
+    with _USAGE36_LOCK:
+        for attempt in range(5):
+            client=None;etag=None
+            if _usage36_shared():
+                client=_storage_container().get_blob_client(_storage_path(relative))
+                try:
+                    download=client.download_blob();doc=json.loads(download.readall());etag=download.properties.etag
+                except ResourceNotFoundError:doc=None
+            else:
+                target=_usage36_local()/relative;doc=json.loads(target.read_text('utf-8')) if target.exists() else None
+            if doc is None:doc={'schema':1,'user':uid,'name':str(ident.get('name') or ident.get('email') or 'Authenticated user')[:200],'email':str(ident.get('email',''))[:254],'session':session,'day':now.date().isoformat(),'first_seen':stamp,'last_seen':stamp,'views':{}}
+            if len(doc['views'])>=2000 and view not in doc['views']:raise ValueError('Session daily view limit reached.')
+            old=doc['views'].get(view)
+            if old and seq<=old.get('seq',-1):return {'ok':True,'duplicate':True}
+            if old and old['page']!=page:raise ValueError('View page cannot change.')
+            previous=old.get('reported',0) if old else 0
+            elapsed=max(0,(now-dt.datetime.fromisoformat(old['last_seen'])).total_seconds()) if old else 60
+            delta=max(0,min(float(seconds)-previous,elapsed+2,60))
+            doc['views'][view]={'page':page,'seconds':round((old.get('seconds',0) if old else 0)+delta,2),'reported':max(float(seconds),previous),'seq':seq,'first_seen':old['first_seen'] if old else stamp,'last_seen':stamp}
+            doc['last_seen']=stamp
+            raw=json.dumps(doc,ensure_ascii=False,allow_nan=False).encode('utf-8')
+            try:
+                if client:
+                    if etag:client.upload_blob(raw,overwrite=True,etag=etag,match_condition=MatchConditions.IfNotModified)
+                    else:client.upload_blob(raw,overwrite=False)
+                else:
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    temporary=target.with_suffix('.tmp');temporary.write_bytes(raw);os.replace(temporary,target)
+                _USAGE36_CACHE.clear()
+                return {'ok':True,'day':now.date().isoformat()}
+            except (ResourceExistsError,ResourceModifiedError):
+                if attempt==4:raise RuntimeError('Analytics write contention; retry later.')
+
+
+def _usage36_documents(year):
+    # Small per-tab/day snapshots avoid one blob per heartbeat and lost multi-replica updates.
+    prefix=f'{_USAGE36_PREFIX}/sessions/{year}/'
+    if _usage36_shared():
+        container=_storage_container()
+        for blob in container.list_blobs(name_starts_with=_storage_path(prefix)):
+            if blob.name.endswith('.json'):
+                yield json.loads(container.get_blob_client(blob.name).download_blob().readall())
+    else:
+        for p in (_usage36_local()/prefix).rglob('*.json'):yield json.loads(p.read_text('utf-8'))
+
+
+def _usage36_summary(query):
+    now=_usage36_now();today=now.date()
+    year=int(query.get('year',[str(today.year)])[0])
+    if not 2020<=year<=today.year:raise ValueError('Choose a year from 2020 through the current year.')
+    start=dt.date.fromisoformat(query.get('from',[f'{year}-01-01'])[0])
+    end=dt.date.fromisoformat(query.get('to',[min(today,dt.date(year,12,31)).isoformat()])[0])
+    if start.year!=year or end.year!=year or start>end:raise ValueError('Dates must be in the selected year, with From before To.')
+    who=str(query.get('user',[''])[0]);key=(year,start.isoformat(),end.isoformat(),who)
+    # No per-heartbeat cache invalidation race can affect the underlying persisted data.
+    with _USAGE36_LOCK:
+        cached=_USAGE36_CACHE.get(key)
+        if cached and time.monotonic()-cached[0]<20:return cached[1]
+    docs=list(_usage36_documents(year));users={};monthly=[0]*12;annual=0;ytd=0
+    cutoff=dt.date(year,today.month,min(today.day,__import__('calendar').monthrange(year,today.month)[1]))
+    daily={};pages={};visitors={};sessions=set();total_seconds=0;first=None
+    for doc in docs:
+        day=dt.date.fromisoformat(doc['day']);uid=doc['user']
+        users[uid]={'id':uid,'name':doc['name'],'email':doc['email']}
+        first=min(first,doc['first_seen']) if first else doc['first_seen']
+        if who and uid!=who:continue
+        views=doc.get('views',{});count=len(views);monthly[day.month-1]+=count;annual+=count
+        if day<=cutoff:ytd+=count
+        if not start<=day<=end:continue
+        sessions.add((uid,doc['session']))
+        u=visitors.setdefault(uid,{'id':uid,'name':doc['name'],'email':doc['email'],'views':0,'seconds':0,'sessions':set(),'days':set(),'last_seen':doc['last_seen']})
+        u['views']+=count;u['sessions'].add(doc['session']);u['days'].add(doc['day']);u['last_seen']=max(u['last_seen'],doc['last_seen'])
+        d=daily.setdefault(doc['day'],{'date':doc['day'],'views':0,'seconds':0,'users':set(),'pages':{}});d['users'].add(uid)
+        for v in views.values():
+            page=v['page'];seconds=float(v.get('seconds',0));total_seconds+=seconds;u['seconds']+=seconds;d['seconds']+=seconds;d['views']+=1
+            p=pages.setdefault(page,{'id':page,'name':_USAGE36_PAGES.get(page,page),'views':0,'seconds':0,'users':set()})
+            p['views']+=1;p['seconds']+=seconds;p['users'].add(uid);d['pages'][page]=d['pages'].get(page,0)+1
+    cursor=start
+    while cursor<=end:
+        daily.setdefault(cursor.isoformat(),{'date':cursor.isoformat(),'views':0,'seconds':0,'users':set(),'pages':{}});cursor+=dt.timedelta(days=1)
+    for d in daily.values():d['users']=len(d['users']);d['seconds']=round(d['seconds'],1)
+    for p in pages.values():p['users']=len(p['users']);p['seconds']=round(p['seconds'],1)
+    for u in visitors.values():u['sessions']=len(u['sessions']);u['days']=len(u['days']);u['seconds']=round(u['seconds'],1)
+    pv=sorted(pages.values(),key=lambda p:(-p['views'],p['name']));total=sum(p['views'] for p in pv)
+    result={'year':year,'from':start.isoformat(),'to':end.isoformat(),'timezone':'UTC','generated':now.isoformat(),'first_recorded_in_year':first,
+        'storage':'Azure Blob Storage' if _usage36_shared() else 'Local development storage (not durable across redeployments)',
+        'kpis':{'views':total,'visitors':len(visitors),'sessions':len(sessions),'seconds':round(total_seconds,1),'avg_session_seconds':round(total_seconds/max(1,len(sessions)),1),'views_per_session':round(total/max(1,len(sessions)),2),'year_views':annual,'ytd_views':ytd,'most_used':pv[0]['name'] if pv else 'No data yet','active_days':sum(d['views']>0 for d in daily.values())},
+        'months':[{'month':f'{year}-{i+1:02}','label':__import__('calendar').month_abbr[i+1],'views':v} for i,v in enumerate(monthly)],
+        'daily':sorted(daily.values(),key=lambda d:d['date']),'pages':pv,'visitors':sorted(visitors.values(),key=lambda u:(-u['views'],u['name'])),'users':sorted(users.values(),key=lambda u:u['name'].lower()),
+        'methodology':'Page views count initial loads, reloads and navigation to a different page or record, not edits, re-renders or API calls. Record IDs and content are never recorded. Sessions are per browser tab, renewed after 30 minutes without interaction. Active time is an estimate: visible, focused tab with input in the previous 2 minutes; heartbeat every 30 seconds. Browser shutdowns, offline periods and blockers can undercount. Multiple tabs are separate sessions. All dates use UTC. Annual and YTD totals use the selected year and visitor, independent of the detail date range; YTD ends at the same month/day as today. Future months are not forecasts. Analytics begin at deployment; no earlier history is reconstructed. Usage is not a measure of employee performance.'}
+    with _USAGE36_LOCK:
+        if len(_USAGE36_CACHE)>30:_USAGE36_CACHE.clear()
+        _USAGE36_CACHE[key]=(time.monotonic(),result)
+    return result
+
+
+def _usage36_pdf(data):
+    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak,KeepTogether
+    from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from xml.sax.saxutils import escape
+    from reportlab.lib.pagesizes import A4
+    buffer=io.BytesIO();styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='UsageTitle',fontName='Helvetica-Bold',fontSize=25,leading=30,textColor=colors.HexColor('#15334d'),spaceAfter=12))
+    styles.add(ParagraphStyle(name='UsageSmall',fontSize=8,leading=12,textColor=colors.HexColor('#52677e')))
+    styles['Heading2'].textColor=colors.HexColor('#1468bb')
+    def p(x,style='BodyText'):return Paragraph(escape(str(x)),styles[style])
+    def table(headers,rows,widths):
+        t=Table([[p(x,'UsageSmall') for x in headers]]+[[p(x,'UsageSmall') for x in row] for row in rows],colWidths=widths,repeatRows=1,hAlign='LEFT')
+        t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e9f2fc')),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f9fc')]),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7),('LINEBELOW',(0,0),(-1,0),.6,colors.HexColor('#b9d4ef'))]));return t
+    k=data['kpis'];story=[p('Workspace usage','UsageTitle'),p(f"ADMINISTRATOR REPORT | {data['from']} to {data['to']} | UTC",'UsageSmall'),Spacer(1,16)]
+    story+=[table(['Page views','Unique visitors','Tab sessions','Active hours'],[[k['views'],k['visitors'],k['sessions'],f"{k['seconds']/3600:.2f}"]],[127]*4),Spacer(1,12),table(['Selected-year views','YTD views','Views / session','Avg active min / session'],[[k['year_views'],k['ytd_views'],k['views_per_session'],f"{k['avg_session_seconds']/60:.1f}"]],[127]*4),Spacer(1,16),p('Monthly page views','Heading2')]
+    drawing=Drawing(508,215);chart=VerticalBarChart();chart.x=36;chart.y=35;chart.width=455;chart.height=160
+    chart.data=[[x['views'] for x in data['months']]];chart.categoryAxis.categoryNames=[x['label'] for x in data['months']];chart.valueAxis.valueMin=0;chart.valueAxis.valueMax=max(5,max(chart.data[0],default=0)*1.2);chart.bars[0].fillColor=colors.HexColor('#2779d8');chart.categoryAxis.labels.fontSize=8;chart.valueAxis.labels.fontSize=8;drawing.add(chart);story.extend([drawing,p(f"Most viewed page: {k['most_used']}. Active days in detail range: {k['active_days']}.",'UsageSmall'),p('Measurement and coverage','Heading2'),p(data['methodology'],'UsageSmall'),p('Storage: '+data['storage']+'. First recorded in selected year: '+str(data['first_recorded_in_year'] or 'No events yet'),'UsageSmall'),PageBreak(),p('Page usage','Heading2')])
+    story.append(table(['Page','Views','Visitors','Active min'],[[x['name'],x['views'],x['users'],f"{x['seconds']/60:.1f}"] for x in data['pages']] or [['No recorded usage',0,0,0]],[280,65,75,88]))
+    story.extend([Spacer(1,18),p('Visitors','Heading2'),p('Authenticated identities and observed usage only. Not a performance assessment.','UsageSmall')])
+    story.append(table(['Visitor / email','Views','Sessions','Active min','Last seen (UTC)'],[[x['name']+' / '+x['email'],x['views'],x['sessions'],f"{x['seconds']/60:.1f}",x['last_seen'][:19].replace('T',' ')] for x in data['visitors']] or [['No visitors',0,0,0,'-']],[205,48,55,65,135]))
+    story.extend([PageBreak(),p('Daily views, overall and per page','Heading2')])
+    story.append(table(['Date (UTC)','Views','Visitors','Active min','Views by page'],[[x['date'],x['views'],x['users'],f"{x['seconds']/60:.1f}",'; '.join(_USAGE36_PAGES.get(a,a)+': '+str(b) for a,b in sorted(x['pages'].items())) or '-'] for x in data['daily']],[65,42,45,55,301]))
+    def footer(canvas,doc):
+        canvas.setFont('Helvetica',8);canvas.setFillColor(colors.HexColor('#63768a'));canvas.drawString(44,25,'LNG ORI Workspace | Administrator usage report | UTC');canvas.drawRightString(A4[0]-44,25,str(doc.page))
+    SimpleDocTemplate(buffer,pagesize=A4,leftMargin=44,rightMargin=43,topMargin=38,bottomMargin=42,title='Workspace usage report',author='LNG ORI Workspace').build(story,onFirstPage=footer,onLaterPages=footer)
+    return buffer.getvalue(),f"workspace_usage_{data['from']}_{data['to']}.pdf"
+
+_USAGE36_GET=Handler.do_GET
+_USAGE36_POST=Handler.do_POST
+
+def _usage36_get(self):
+    path=urlparse(self.path).path
+    if path not in ('/api/usage/summary','/api/usage/report.pdf'):return _USAGE36_GET(self)
+    try:
+        if not self.host_ok():raise PermissionError('Invalid host.')
+        _auth_require(self,ADMIN_ROLES)
+        data=_usage36_summary(_ext_qs(urlparse(self.path).query))
+        if path.endswith('.pdf'):
+            try:raw,name=_usage36_pdf(data)
+            except ImportError:self.send(503,{'error':'PDF export requires reportlab. Add reportlab to requirements-radix.txt and rebuild.'});return
+            _ext_binary(self,raw,'application/pdf',name)
+        else:self.send(200,data)
+    except PermissionError as exc:self.send(403,{'error':str(exc)})
+    except ValueError as exc:self.send(400,{'error':str(exc)})
+    except Exception:self.send(503,{'error':'Usage analytics storage is unavailable. Workspace data and permissions are unchanged. Try again later.'})
+
+def _usage36_post(self):
+    if urlparse(self.path).path!='/api/usage/event':return _USAGE36_POST(self)
+    try:
+        if not self.host_ok() or not self.origin_ok(self.headers.get('Origin')) or not _valid_request_token(self.headers.get('X-ORI-Token')):raise PermissionError('Invalid usage request.')
+        _auth_require(self,READ_ROLES)
+        length=int(self.headers.get('Content-Length','0'))
+        if not 0<length<=4096:raise ValueError('Invalid usage payload size.')
+        body=json.loads(self.rfile.read(length))
+        if not isinstance(body,dict):raise ValueError('Invalid usage payload.')
+        self.send(200,_usage36_ingest(self,body))
+    except PermissionError as exc:self.send(403,{'error':str(exc)})
+    except (ValueError,TypeError) as exc:self.send(400,{'error':str(exc)})
+    except Exception:self.send(503,{'error':'Usage tracking temporarily unavailable.'})
+
+Handler.do_GET=_usage36_get
+Handler.do_POST=_usage36_post
+
+_USAGE36_UI='<style>\n/* V36 styles are scoped to the new dashboard. */\n.u36{--u-blue:#3984ff;--u-teal:#13b9a0;--u-violet:#9867ef;--u-amber:#eead42;max-width:1700px;margin:auto}.u36-hero{border-radius:20px;background:linear-gradient(115deg,#102b49,#204a78 65%,#32518a);color:#fff;padding:28px 30px;display:flex;justify-content:space-between;align-items:center;gap:20px;box-shadow:0 12px 28px #122d4b18}.u36-hero h1{font-size:30px;color:#fff;margin:5px 0}.u36-hero p{color:#d2e3f7;margin:0;font-size:14px}.u36-eyebrow{text-transform:uppercase;letter-spacing:2px;font-size:11px;color:#9bd5ff}.u36-actions{display:flex;gap:8px;flex-wrap:wrap}.u36-actions button{background:#ffffff12;color:white;border-color:#ffffff45}.u36-actions button.primary{background:#fff;color:#204a78}.u36-filters{display:flex;gap:12px;align-items:end;flex-wrap:wrap;padding:18px 0}.u36-filters label{display:grid;gap:4px;font-size:11px;color:var(--muted);margin:0}.u36-filters input,.u36-filters select{border:1px solid var(--line);background:var(--panel);color:var(--text);padding:8px 10px;border-radius:9px;min-height:40px;width:auto;max-width:280px}.u36-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:4px 0 18px}.u36-kpi{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:19px;position:relative;overflow:hidden}.u36-kpi:before{content:\'\';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--tone)}.u36-kpi small{font-size:12px}.u36-kpi strong{display:block;overflow-wrap:anywhere;font-size:29px;line-height:1.3;margin:7px 0;color:var(--text);letter-spacing:-.7px}.u36-kpi span{font-size:11px;color:var(--muted)}.u36-grid{display:grid;grid-template-columns:1.55fr 1fr;gap:16px;margin-bottom:16px}.u36-panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px;min-width:0}.u36-panel h2{font-size:17px;margin:0 0 3px}.u36-panel .u36-sub{font-size:12px;color:var(--muted);margin:0 0 18px}.u36-scroll{overflow:auto}.u36 svg{display:block;width:100%;height:auto;color:var(--muted)}.u36-chart{min-width:560px}.u36-legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:12px}.u36-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}.u36-donut{display:grid;grid-template-columns:155px 1fr;gap:16px;align-items:center}.u36-donut svg{max-width:155px}.u36-legend-row{display:flex;justify-content:space-between;gap:12px;font-size:12px;margin:10px 0}.u36-table{width:100%;border-collapse:collapse;font-size:12px}.u36-table th{font-size:10px;text-transform:uppercase;letter-spacing:.6px;text-align:left;color:var(--muted);padding:11px 9px;background:var(--soft);white-space:nowrap}.u36-table td{padding:12px 9px;border-bottom:1px solid var(--line);vertical-align:middle}.u36-table td small{font-size:10px;display:block}.u36-table .u36-num{text-align:right;font-variant-numeric:tabular-nums}.u36-meter{height:5px;border-radius:6px;background:var(--soft);margin-top:6px;max-width:180px;overflow:hidden}.u36-meter i{display:block;height:100%;background:var(--u-blue);border-radius:6px}.u36-empty{text-align:center;padding:35px 15px;color:var(--muted);font-size:13px}.u36-note{border-radius:11px;background:var(--soft);padding:13px 16px;font-size:12px;color:var(--muted);margin:14px 0}.u36-status{font-size:11px;color:var(--muted);margin:10px 0}.u36-search{margin:12px 0;width:100%;max-width:360px;padding:9px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text)}.u36-error{border:1px solid #db6379;background:#bf38540c;padding:18px;border-radius:12px;color:var(--red)}.u36 details summary{cursor:pointer;font-size:13px;font-weight:600}.u36 table caption{text-align:left;padding:8px;font-size:12px;color:var(--muted)}#u36Privacy{font-size:10px;color:#b4c9dc;padding:9px 16px;border-top:1px solid #ffffff15}\n@media(max-width:1150px){.u36-grid{grid-template-columns:1fr}.u36-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.u36-hero{padding:20px;align-items:start;flex-direction:column}.u36-kpis{gap:8px}.u36-kpi{padding:13px}.u36-kpi strong{font-size:23px}.u36-panel{padding:15px}.u36-donut{grid-template-columns:125px 1fr}}\n</style>\n<script>\n// V36: additive analytics; no workspace save calls, permissions or records changed.\nconst U36={data:null,loading:0,filter:null,colors:[\'#3984ff\',\'#13b9a0\',\'#9867ef\',\'#eead42\',\'#e16e91\',\'#5db6da\',\'#7f96af\'],trackError:false};\nfunction u36UUID(){return crypto.randomUUID?crypto.randomUUID():(\'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx\'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]%16;return(c===\'x\'?r:(r&3|8)).toString(16)}))}\nfunction u36Session(){try{const saved=JSON.parse(sessionStorage.getItem(\'ori_usage_v36_session\')||\'null\');if(saved&&Date.now()-saved.lastInput<1800000)return saved.session}catch(e){}return u36UUID()}\nconst U36T={session:u36Session(),view:null,page:\'\',key:\'\',seconds:0,seq:0,lastInput:Date.now(),lastTick:performance.now(),day:new Date().toISOString().slice(0,10),lastFlush:0,lastStored:0,lastQueuedView:\'\',lastQueuedSeconds:-1,ready:false,pending:new Map(),busy:false};\nfunction u36Page(){\n if(route.ref)return {page:\'record:\'+route.ref.type,key:\'record:\'+route.ref.type+\':\'+route.ref.id};\n if(route.page===\'counterparts\'&&typeof XDEV!==\'undefined\'&&XDEV.cp)return {page:\'record:counterpart\',key:\'counterpart:\'+XDEV.cp};\n const page=String(route.page||\'overview\');return {page,key:page};\n}\nfunction u36Payload(){return {session:U36T.session,view:U36T.view,page:U36T.page,seconds:Math.round(U36T.seconds*10)/10,seq:++U36T.seq}}\nfunction u36Queue(){if(!U36T.view||!U36T.ready)return;const seconds=Math.round(U36T.seconds*10)/10;if(U36T.lastQueuedView===U36T.view&&U36T.lastQueuedSeconds===seconds){u36Drain();return}const b=u36Payload();U36T.lastQueuedView=b.view;U36T.lastQueuedSeconds=b.seconds;U36T.pending.set(b.view,b);if(U36T.pending.size>100)U36T.pending.delete(U36T.pending.keys().next().value);u36Drain()}\nasync function u36Drain(){\n if(U36T.busy||!U36T.pending.size)return;U36T.busy=true;\n try{for(const [id,b] of [...U36T.pending]){const r=await fetch(\'/api/usage/event\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\',\'X-ORI-Token\':TOKEN},body:JSON.stringify(b),keepalive:true,signal:typeof AbortSignal!==\'undefined\'&&AbortSignal.timeout?AbortSignal.timeout(12000):undefined});if(!r.ok)throw Error(\'Tracking unavailable\');if(U36T.pending.get(id)===b)U36T.pending.delete(id);U36.trackError=false}}\n catch(e){U36.trackError=true}finally{U36T.busy=false;if(U36T.pending.size&&!U36.trackError)setTimeout(u36Drain,0)}\n}\nfunction u36Accrue(){const now=performance.now(),elapsed=Math.max(0,Math.min(2,(now-U36T.lastTick)/1000));U36T.lastTick=now;if(U36T.ready&&U36T.view&&document.visibilityState===\'visible\'&&document.hasFocus()&&Date.now()-U36T.lastInput<120000)U36T.seconds+=elapsed}\nfunction u36Observe(){\n const identity=typeof ORI_MODE!==\'undefined\'?ORI_MODE.identity:null;if(!identity?.can_read)return;\n U36T.ready=true;const p=u36Page(),day=new Date().toISOString().slice(0,10);\n if(U36T.key!==p.key||day!==U36T.day){u36Accrue();if(day===U36T.day)u36Queue();U36T.key=p.key;U36T.page=p.page;U36T.view=u36UUID();U36T.seconds=0;U36T.seq=0;U36T.day=day;u36Queue()}\n}\nfunction u36Input(){const now=Date.now();if(now-U36T.lastInput>1800000){u36Queue();U36T.session=u36UUID();U36T.key=\'\';U36T.view=null;U36T.seconds=0;U36T.seq=0}U36T.lastInput=now;if(now-U36T.lastStored>15000){U36T.lastStored=now;try{sessionStorage.setItem(\'ori_usage_v36_session\',JSON.stringify({session:U36T.session,lastInput:now}))}catch(e){}}}\nfor(const type of [\'pointerdown\',\'pointermove\',\'keydown\',\'scroll\',\'touchstart\'])window.addEventListener(type,u36Input,{passive:true});\nsetInterval(()=>{u36Accrue();u36Observe();if(Date.now()-U36T.lastFlush>30000){U36T.lastFlush=Date.now();u36Queue()}u36Nav()},1000);\ndocument.addEventListener(\'visibilitychange\',()=>{u36Accrue();u36Queue()});window.addEventListener(\'pagehide\',()=>{u36Accrue();u36Queue()});window.addEventListener(\'online\',u36Drain);\nfunction u36Nav(){\n const admin=typeof oriModeIsAdmin===\'function\'&&oriModeIsAdmin(),host=$(\'nav\');if(!host)return;\n let button=$(\'u36Nav\');if(admin&&!button){button=document.createElement(\'button\');button.id=\'u36Nav\';button.dataset.page=\'usage\';button.onclick=()=>go(\'usage\');button.innerHTML=\'<span class="ico" aria-hidden="true">▥</span><span class="word">Usage Analytics</span>\';host.appendChild(button)}else if(!admin&&button)button.remove();\n if(button)button.classList.toggle(\'active\',route.page===\'usage\');\n if(!$(\'u36Privacy\')){const side=document.querySelector(\'.sidebar\');if(side){const note=document.createElement(\'div\');note.id=\'u36Privacy\';note.textContent=\'Usage analytics enabled\';note.title=\'Authenticated page visits and estimated active time are recorded for administrators. No record content, keystrokes or IP addresses are collected.\';side.appendChild(note)}}\n}\nconst u36OldNav=nav;nav=function(...args){const r=u36OldNav(...args);u36Nav();return r};\nconst u36OldRender=render;render=function(...args){\n if(route.page===\'usage\'&&!route.ref){theme();nav();if(!oriModeIsAdmin()){$(\'page\').innerHTML=\'<div class="notice">Administrator access is required to view usage analytics.</div>\';return}u36Render();u36Observe();return}\n const r=u36OldRender(...args);u36Observe();return r;\n};\nfunction u36Defaults(){const now=new Date(),year=now.getUTCFullYear();return {year,from:year+\'-01-01\',to:now.toISOString().slice(0,10),user:\'\'}}\nfunction u36Params(){return new URLSearchParams(U36.filter||u36Defaults()).toString()}\nfunction u36Num(n){return Number(n||0).toLocaleString(undefined,{maximumFractionDigits:1})}\nfunction u36Time(s){return s>=3600?u36Num(s/3600)+\' h\':u36Num(s/60)+\' min\'}\nfunction u36Card(label,value,note,color){return `<article class="u36-kpi" style="--tone:${color}"><small>${E(label)}</small><strong>${E(String(value))}</strong><span>${E(note)}</span></article>`}\nfunction u36Bars(rows,field,label,color=\'#3984ff\',daily=false){\n const width=Math.max(600,rows.length*(daily?15:45)),height=220,left=45,right=15,top=25,bottom=40,plot=height-top-bottom,max=Math.max(1,...rows.map(x=>Number(x[field]||0))),step=(width-left-right)/Math.max(1,rows.length),bar=Math.max(2,step*.64);\n let svg=`<svg class="u36-chart" style="min-width:${daily?width:0}px;max-height:280px" viewBox="0 0 ${width} ${height}" role="img" aria-label="${E(daily?\'Daily page views\':\'Monthly page views\')}">`;\n for(let i=0;i<=4;i++){const y=top+plot*i/4;svg+=`<line x1="${left}" x2="${width-right}" y1="${y}" y2="${y}" stroke="currentColor" opacity=".13"/><text x="${left-8}" y="${y+4}" text-anchor="end" fill="currentColor" font-size="10">${u36Num(max*(1-i/4))}</text>`}\n rows.forEach((r,i)=>{const h=Number(r[field]||0)/max*plot,x=left+i*step+(step-bar)/2,y=top+plot-h;svg+=`<rect x="${x}" y="${y}" width="${bar}" height="${h}" rx="3" fill="${color}"><title>${E(String(r[label]))}: ${u36Num(r[field])} views</title></rect>`;if(!daily||i%Math.max(1,Math.ceil(rows.length/16))===0)svg+=`<text x="${x+bar/2}" y="${height-17}" text-anchor="middle" fill="currentColor" font-size="10">${E(String(r[label]).slice(daily?5:0))}</text>`;if(!daily)svg+=`<text x="${x+bar/2}" y="${Math.max(13,y-6)}" text-anchor="middle" fill="currentColor" font-size="10">${u36Num(r[field])}</text>`});return svg+\'</svg>\';\n}\nfunction u36Donut(pages){\n const total=pages.reduce((n,p)=>n+p.views,0);if(!total)return \'<div class="u36-empty">Page distribution appears after the first visits.</div>\';\n const list=pages.slice(0,5);if(pages.length>5)list.push({name:\'Other pages\',views:pages.slice(5).reduce((n,p)=>n+p.views,0)});let offset=0;\n const circles=list.map((p,i)=>{const size=p.views/total*100,c=`<circle cx="70" cy="70" r="52" fill="none" stroke="${U36.colors[i]}" stroke-width="17" pathLength="100" stroke-dasharray="${size} ${100-size}" stroke-dashoffset="${-offset}" transform="rotate(-90 70 70)"><title>${E(p.name)}: ${u36Num(p.views)} views</title></circle>`;offset+=size;return c}).join(\'\');\n return `<div class="u36-donut"><svg viewBox="0 0 140 140" role="img" aria-label="Page view distribution">${circles}<text x="70" y="68" text-anchor="middle" fill="currentColor" font-size="22" font-weight="700">${u36Num(total)}</text><text x="70" y="86" text-anchor="middle" fill="currentColor" font-size="10">page views</text></svg><div>${list.map((p,i)=>`<div class="u36-legend-row"><span><i class="u36-dot" style="background:${U36.colors[i]}"></i>${E(p.name)}</span><b>${u36Num(p.views/total*100)}%</b></div>`).join(\'\')}</div></div>`;\n}\nfunction u36Visitors(query=\'\'){\n const host=$(\'u36Visitors\');if(!host||!U36.data)return;const q=query.toLowerCase(),rows=U36.data.visitors.filter(x=>(x.name+\' \'+x.email).toLowerCase().includes(q));\n host.innerHTML=rows.length?`<table class="u36-table"><thead><tr><th>Visitor</th><th>Views</th><th>Tab sessions</th><th>Active time</th><th>Active days</th><th>Last seen (UTC)</th></tr></thead><tbody>${rows.map(x=>`<tr><td><b>${E(x.name)}</b><small>${E(x.email)}</small></td><td>${u36Num(x.views)}</td><td>${u36Num(x.sessions)}</td><td>${u36Time(x.seconds)}</td><td>${x.days}</td><td>${E(x.last_seen.slice(0,19).replace(\'T\',\' \'))}</td></tr>`).join(\'\')}</tbody></table>`:\'<div class="u36-empty">No visitors match this selection.</div>\';\n}\nfunction u36Body(d){\n const k=d.kpis,range=d.from+\' to \'+d.to+\' · UTC\',max=Math.max(1,...d.pages.map(p=>p.views));\n return `<div class="u36-kpis">${u36Card(\'Page views\',u36Num(k.views),\'Selected detail period\',U36.colors[0])}${u36Card(\'Unique visitors\',u36Num(k.visitors),\'Authenticated users\',U36.colors[1])}${u36Card(\'Active time\',u36Time(k.seconds),\'Foreground activity estimate\',U36.colors[2])}${u36Card(\'Tab sessions\',u36Num(k.sessions),\'30-minute inactivity reset\',U36.colors[3])}${u36Card(\'Selected-year views\',u36Num(k.year_views),d.year+\' · recorded full-year total\',U36.colors[0])}${u36Card(\'YTD views\',u36Num(k.ytd_views),\'Selected year · same date cutoff as today\',U36.colors[1])}${u36Card(\'Avg active time / session\',u36Time(k.avg_session_seconds),u36Num(k.views_per_session)+\' views per session\',U36.colors[2])}${u36Card(\'Most viewed page\',k.most_used,k.active_days+\' active days in selected period\',U36.colors[3])}</div>\n <div class="u36-grid"><section class="u36-panel"><h2>Monthly traffic</h2><p class="u36-sub">${d.year} · all recorded views in the selected year and visitor filter</p><div class="u36-scroll">${u36Bars(d.months,\'views\',\'label\')}</div></section><section class="u36-panel"><h2>Annual overview</h2><p class="u36-sub">Recorded totals, not a forecast</p><div class="u36-scroll">${u36Bars([{label:\'Full year\',views:k.year_views},{label:\'YTD\',views:k.ytd_views}],\'views\',\'label\',\'#9867ef\')}</div></section></div>\n <section class="u36-panel" style="margin-bottom:16px"><h2>Daily activity</h2><p class="u36-sub">${E(range)} · hover over bars for exact values; scroll to see all days</p><div class="u36-scroll">${u36Bars(d.daily,\'views\',\'date\',\'#13b9a0\',true)}</div></section>\n <div class="u36-grid"><section class="u36-panel"><h2>Page usage</h2><p class="u36-sub">Views, unique visitors and active time by page</p><div class="u36-scroll">${d.pages.length?`<table class="u36-table"><thead><tr><th>Page</th><th>Views</th><th>Visitors</th><th>Active time</th></tr></thead><tbody>${d.pages.map(p=>`<tr><td>${E(p.name)}<div class="u36-meter"><i style="width:${p.views/max*100}%"></i></div></td><td>${u36Num(p.views)}</td><td>${p.users}</td><td>${u36Time(p.seconds)}</td></tr>`).join(\'\')}</tbody></table>`:\'<div class="u36-empty">No page views recorded in this period.</div>\'}</div></section><section class="u36-panel"><h2>Where visits happen</h2><p class="u36-sub">Share of page views in the selected period</p>${u36Donut(d.pages)}</section></div>\n <section class="u36-panel" style="margin-bottom:16px"><h2>Visitors and observed usage</h2><p class="u36-sub">Administrator-only authenticated identities. Usage is not an employee performance measure.</p><input class="u36-search" aria-label="Search visitors" placeholder="Search visitor name or email..." oninput="u36Visitors(this.value)"><div id="u36Visitors" class="u36-scroll"></div></section>\n <section class="u36-panel"><details><summary>Daily views by page · detailed breakdown</summary><div class="u36-scroll"><table class="u36-table"><thead><tr><th>Date (UTC)</th><th>Total</th><th>Visitors</th>${d.pages.map(p=>`<th>${E(p.name)}</th>`).join(\'\')}</tr></thead><tbody>${d.daily.map(day=>`<tr><td>${day.date}</td><td>${day.views}</td><td>${day.users}</td>${d.pages.map(p=>`<td class="u36-num" style="background:${day.pages[p.id]?\'#3984ff15\':\'transparent\'}">${day.pages[p.id]||0}</td>`).join(\'\')}</tr>`).join(\'\')}</tbody></table></div></details></section>\n <div class="u36-note"><b>Measurement and coverage</b><br>${E(d.methodology)}</div><div class="u36-status">Storage: ${E(d.storage)} · First recorded in selected year: ${E(d.first_recorded_in_year?.slice(0,19).replace(\'T\',\' \')||\'No events yet\')} · Updated ${E(d.generated.slice(0,19).replace(\'T\',\' \'))} UTC${U36.trackError?\' · This browser could not send its latest tracking update. It will retry.\':\'\'}</div>`;\n}\nfunction u36Render(){\n U36.filter=U36.filter||u36Defaults();const f=U36.filter,now=new Date(),users=U36.data?.users||[];\n $(\'page\').innerHTML=`<div class="u36"><header class="u36-hero"><div><div class="u36-eyebrow">Administrator workspace intelligence</div><h1>Usage Analytics</h1><p>A clear view of visits, engagement and the pages people use.</p></div><div class="u36-actions"><button onclick="u36Load()">Refresh</button><button class="primary" onclick="u36Download()">Download PDF report</button></div></header><div class="u36-filters"><label>Year<select id="u36Year" onchange="u36YearChange(this.value)">${Array.from({length:now.getUTCFullYear()-2019},(_,i)=>now.getUTCFullYear()-i).map(y=>`<option ${+f.year===y?\'selected\':\'\'}>${y}</option>`).join(\'\')}</select></label><label>From (UTC)<input type="date" id="u36From" value="${E(f.from)}"></label><label>To (UTC)<input type="date" id="u36To" value="${E(f.to)}"></label><label>Visitor<select id="u36User"><option value="">All visitors</option>${users.map(u=>`<option value="${E(u.id)}" ${f.user===u.id?\'selected\':\'\'}>${E(u.name+\' · \'+u.email)}</option>`).join(\'\')}</select></label><button onclick="u36Apply()">Apply filters</button><button onclick="u36Preset(\'month\')">This month</button><button onclick="u36Preset(\'ytd\')">YTD</button><button onclick="u36Preset(\'year\')">Full year</button></div><div id="u36Content">${U36.data?u36Body(U36.data):\'<div class="u36-note">Loading usage analytics...</div>\'}</div></div>`;\n if(U36.data)u36Visitors();else u36Load();\n}\nfunction u36YearChange(year){const y=+year,now=new Date();U36.filter={...U36.filter,year:y,from:y+\'-01-01\',to:y===now.getUTCFullYear()?now.toISOString().slice(0,10):y+\'-12-31\',user:\'\'};U36.data=null;u36Render()}\nfunction u36Preset(mode){const y=+U36.filter.year,now=new Date(),current=y===now.getUTCFullYear(),month=String(now.getUTCMonth()+1).padStart(2,\'0\'),last=new Date(Date.UTC(y,now.getUTCMonth()+1,0)).getUTCDate();U36.filter.from=mode===\'month\'?`${y}-${month}-01`:`${y}-01-01`;U36.filter.to=mode===\'year\'?`${y}-12-31`:current?now.toISOString().slice(0,10):`${y}-${month}-${String(mode===\'month\'?last:Math.min(now.getUTCDate(),last)).padStart(2,\'0\')}`;U36.data=null;u36Render()}\nfunction u36Apply(){U36.filter={year:+$(\'u36Year\').value,from:$(\'u36From\').value,to:$(\'u36To\').value,user:$(\'u36User\').value};u36Load()}\nasync function u36Load(){\n if(!oriModeIsAdmin()||route.page!==\'usage\')return;const request=++U36.loading,host=$(\'u36Content\');if(host)host.innerHTML=\'<div class="u36-note">Loading usage analytics...</div>\';\n try{const r=await fetch(\'/api/usage/summary?\'+u36Params(),{cache:\'no-store\'}),d=await r.json();if(!r.ok)throw Error(d.error||\'Analytics unavailable\');if(request!==U36.loading||route.page!==\'usage\')return;U36.data=d;u36Render()}\n catch(e){if(request===U36.loading&&route.page===\'usage\'&&$(\'u36Content\'))$(\'u36Content\').innerHTML=`<div class="u36-error">${E(e.message)}<br>Other workspace features are unaffected.</div>`}\n}\nasync function u36Download(){\n if(!oriModeIsAdmin())return;\n try{const r=await fetch(\'/api/usage/report.pdf?\'+u36Params(),{cache:\'no-store\'});if(!r.ok){const d=await r.json();throw Error(d.error||\'PDF export failed\')}const blob=await r.blob(),url=URL.createObjectURL(blob),a=document.createElement(\'a\');a.href=url;a.download=\'workspace_usage_\'+U36.filter.from+\'_\'+U36.filter.to+\'.pdf\';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){toast(e.message)}\n}\nconst u36OldPaint=oriModePaint;oriModePaint=function(...args){const r=u36OldPaint(...args);u36Nav();if(route.page===\'usage\'&&oriModeIsAdmin()&&!document.querySelector(\'.u36\'))u36Render();return r};\nu36Nav();u36Observe();\n</script>\n'
+HTML=HTML.replace('</body>',_USAGE36_UI+'</body>')
+_V28_PREVIEW_HTML=HTML.replace('<head>','<head>'+_V28_PREVIEW_BOOT,1).replace('</body>',_V28_PREVIEW_END+'</body>')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
