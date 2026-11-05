@@ -3567,6 +3567,346 @@ _USAGE36_UI='<style>\n/* V36 styles are scoped to the new dashboard. */\n.u36{--
 HTML=HTML.replace('</body>',_USAGE36_UI+'</body>')
 _V28_PREVIEW_HTML=HTML.replace('<head>','<head>'+_V28_PREVIEW_BOOT,1).replace('</body>',_V28_PREVIEW_END+'</body>')
 
+
+# V37 additive My Desk and concise opportunity briefings.
+# Existing workspace JSON, saves, qualification, roles and backups are untouched.
+# New desk preferences/roster use a separate prefix in the existing container.
+_D37_PREFIX='personal_desks/v37/profiles/'
+_D37_LOCK=threading.RLock()
+_D37_COLLECTIONS={'lead':'records','tender':'tenders','counterpart':'counterparts','need':'needs','insight':'intelligence','idea':'ideas','action':'actions','milestone':'milestones'}
+
+def _d37_norm(value):
+    import unicodedata
+    return ' '.join(unicodedata.normalize('NFKC',str(value or '')).casefold().split())
+
+def _d37_identity(h):
+    ident=_auth_identity(h);claims=_auth_claims(h)
+    email=_d37_norm(ident.get('email'));subject=str(claims.get('oid') or claims.get('sub') or '')
+    if not email and not subject:raise PermissionError('An authenticated identity is required.')
+    key=_request_hashlib.sha256((('email:'+email) if email else ('subject:'+str(claims.get('tid',''))+'|'+subject)).encode()).hexdigest()[:40]
+    return key,ident,subject
+
+def _d37_local():
+    from pathlib import Path
+    p=Path(DATA).parent/'ori_personal_desks_v37';p.mkdir(parents=True,exist_ok=True);return p
+
+def _d37_read(key):
+    if not re.fullmatch(r'[0-9a-f]{40}',str(key)):raise ValueError('Invalid desk identifier.')
+    if _usage36_shared():
+        client=_storage_container().get_blob_client(_storage_path(_D37_PREFIX+key+'.json'))
+        try:
+            download=client.download_blob();return json.loads(download.readall()),download.properties.etag
+        except ResourceNotFoundError:return None,None
+    p=_d37_local()/(key+'.json')
+    return (json.loads(p.read_text('utf-8')),None) if p.exists() else (None,None)
+
+def _d37_update(key,change):
+    with _D37_LOCK:
+        for attempt in range(5):
+            old,etag=_d37_read(key);doc=change(copy.deepcopy(old))
+            if old==doc:return doc
+            raw=json.dumps(doc,ensure_ascii=False,allow_nan=False).encode('utf-8')
+            try:
+                if _usage36_shared():
+                    client=_storage_container().get_blob_client(_storage_path(_D37_PREFIX+key+'.json'))
+                    if etag:client.upload_blob(raw,overwrite=True,etag=etag,match_condition=MatchConditions.IfNotModified)
+                    else:client.upload_blob(raw,overwrite=False)
+                else:
+                    p=_d37_local()/(key+'.json');tmp=p.with_suffix('.tmp');tmp.write_bytes(raw);os.replace(tmp,p)
+                return doc
+            except (ResourceExistsError,ResourceModifiedError):
+                if attempt==4:raise RuntimeError('Desk preferences changed concurrently. Please retry.')
+
+def _d37_roster():
+    if _usage36_shared():
+        container=_storage_container();result=[]
+        for blob in container.list_blobs(name_starts_with=_storage_path(_D37_PREFIX)):
+            if re.search(r'/[0-9a-f]{40}\.json$',blob.name):result.append(json.loads(container.get_blob_client(blob.name).download_blob().readall()))
+    else:result=[json.loads(p.read_text('utf-8')) for p in _d37_local().glob('*.json')]
+    return sorted([p for p in result if p.get('access_level') in ('writer','admin','pending')],key=lambda p:_d37_norm(p.get('name')))
+
+def _d37_register(h):
+    key,ident,subject=_d37_identity(h);stamp=dt.datetime.now(dt.timezone.utc).isoformat()
+    def change(p):
+        p=p or {'id':key,'aliases':[],'bookmarks':[],'reviewed_at':'','created':stamp}
+        if p.get('subject') and subject and p['subject']!=subject:raise PermissionError('Desk identity binding does not match. Ask an administrator to review the account.')
+        p.update(name=str(ident.get('name') or ident.get('email') or 'Workspace user')[:200],email=str(ident.get('email') or '')[:254],access_level=ident['access_level'],subject=subject)
+        # Persist at most hourly, not on every navigation or page refresh.
+        if not p.get('last_confirmed') or stamp[:13]!=p['last_confirmed'][:13]:p['last_confirmed']=stamp
+        return p
+    return _d37_update(key,change)
+
+def _d37_tokens(value):
+    if isinstance(value,list):return set().union(*[_d37_tokens(v) for v in value]) if value else set()
+    if isinstance(value,dict):return set().union(*[_d37_tokens(value.get(k)) for k in ('name','displayName','email','upn')])
+    text=str(value or '');return {_d37_norm(text)}|{_d37_norm(v) for v in re.split(r'[;\n]|\s+&\s+|\s+and\s+',text) if v.strip()}
+
+def _d37_aliases(profile,roster):
+    aliases={_d37_norm(profile.get('name')),_d37_norm(profile.get('email'))}|{_d37_norm(v) for v in profile.get('aliases',[])};aliases.discard('')
+    # Shared display names / aliases are not guessed. Email remains exact.
+    conflicts=set()
+    for other in roster:
+        if other['id']==profile['id']:continue
+        theirs={_d37_norm(other.get('name')),_d37_norm(other.get('email'))}|{_d37_norm(v) for v in other.get('aliases',[])}
+        conflicts|=aliases&theirs
+    return aliases-conflicts,sorted(conflicts)
+
+def _d37_roles(x,aliases,kind='lead'):
+    fields=[('Owner',x.get('owner')),('Responsible',x.get('responsible')),('Assignee',x.get('assignee')),('Contributor',x.get('contributor'))]
+    if kind in ('action','milestone'):fields += [('Assigned person',x.get('person')),('Assigned person',x.get('person_name'))]
+    if kind=='lead':fields += [('Peer',x.get('peer')),('Portfolio analysis',x.get('analyst'))]+[(str(k).replace('_',' '),v) for k,v in (x.get('responsibilities') or {}).items()]
+    return [label for label,value in fields if _d37_tokens(value)&aliases]
+
+def _d37_done(x):return _d37_norm(x.get('status')) in ('done','completed','cancelled','closed')
+def _d37_archived(x):return x.get('workflow_state')=='archived' or bool(x.get('workflow_archived'))
+def _d37_current(x):return not _d37_archived(x) and (x.get('kind')=='current' or x.get('lifecycle')=='Signed' or x.get('workflow_state')=='current')
+def _d37_name(x):return str(x.get('name') or x.get('title') or 'Untitled')
+def _d37_date(value):
+    try:return dt.date.fromisoformat(str(value or '')[:10]).isoformat()
+    except (ValueError,TypeError):return ''
+
+def _d37_item(kind,x,roles=None):
+    return {'type':kind,'id':x['id'],'name':_d37_name(x),'owner':str(x.get('owner') or x.get('responsible') or ''),'counterpart':str(x.get('counterpart') or ''),'stage':str(x.get('workflow_stage') or x.get('stage') or x.get('status') or ''),'updated':str(x.get('updated') or x.get('date') or ''),'roles':roles or [],'qualified':bool((x.get('qualification') or {}).get('verified') is True),'current':_d37_current(x) if kind=='lead' else False,'date':_d37_date(x.get('due') or x.get('end') or x.get('date')),'ref':x.get('ref') if isinstance(x.get('ref'),dict) else None}
+
+def _d37_get_entity(workspace,ref):
+    if not isinstance(ref,dict) or ref.get('type') not in _D37_COLLECTIONS:return None
+    return next((x for x in workspace.get(_D37_COLLECTIONS[ref['type']],[]) if x.get('id')==ref.get('id')),None)
+
+def _d37_summary(h,target=''):
+    key,identity,subject=_d37_identity(h)
+    if target and target!=key and not identity['is_admin']:raise PermissionError('You may only open your own desk.')
+    target=target or key;profile,_=_d37_read(target)
+    if not profile or profile.get('access_level') not in ('writer','admin','pending'):raise ValueError('This desk is not registered. Refresh My Desk after signing in.')
+    if target==key and profile.get('subject') and profile['subject']!=subject:raise PermissionError('Desk identity binding does not match.')
+    roster=_d37_roster();aliases,conflicts=_d37_aliases(profile,roster);workspace=state();today=dt.datetime.now(dt.timezone.utc).date();limit=(today+dt.timedelta(days=30)).isoformat()
+    groups={k:[] for k in ('leads','contracts','tenders','counterparts','inputs','actions','upcoming','attention')}
+    for kind,col,out in [('lead','records','leads'),('tender','tenders','tenders'),('counterpart','counterparts','counterparts'),('need','needs','inputs'),('insight','intelligence','inputs'),('idea','ideas','inputs')]:
+        for x in workspace.get(col,[]):
+            if _d37_archived(x):continue
+            if kind in ('insight','idea') and (x.get('converted_lead_id') or x.get('converted_idea_id')):continue
+            roles=_d37_roles(x,aliases,kind)
+            if not roles:continue
+            item=_d37_item(kind,x,roles);groups['contracts' if kind=='lead' and _d37_current(x) else out].append(item)
+    owned_refs={(x['type'],x['id']) for k in ('leads','contracts','tenders','inputs') for x in groups[k]}
+    def active_ref(x):
+        ref=x.get('ref');parent=_d37_get_entity(workspace,ref) if ref else None
+        return not ref or (parent is not None and not _d37_archived(parent))
+    for x in workspace.get('actions',[]):
+        if _d37_done(x) or not active_ref(x) or not _d37_roles(x,aliases,'action'):continue
+        item=_d37_item('action',x,_d37_roles(x,aliases,'action'));item['date']=_d37_date(x.get('due'));groups['actions'].append(item)
+    for kind,col in [('action','actions'),('milestone','milestones')]:
+        for x in workspace.get(col,[]):
+            if _d37_done(x) or not active_ref(x):continue
+            direct=bool(_d37_roles(x,aliases,kind));ref=x.get('ref') or {};context=(ref.get('type'),ref.get('id')) in owned_refs
+            if not direct and not context:continue
+            due=_d37_date(x.get('due') if kind=='action' else x.get('end') or x.get('start'))
+            if not due or due>limit:continue
+            item=_d37_item(kind,x);item.update(date=due,context=not direct,past_date=due<today.isoformat());groups['upcoming'].append(item)
+    for item in groups['leads']+groups['tenders']:
+        linked=[x for x in workspace.get('actions',[]) if (x.get('ref') or {}).get('type')==item['type'] and (x.get('ref') or {}).get('id')==item['id'] and not _d37_done(x)]
+        source=_d37_get_entity(workspace,item);next_step=source.get('next_step') or source.get('next_action') or source.get('next_steps')
+        dates=[x for x in workspace.get('milestones',[]) if (x.get('ref') or {}).get('type')==item['type'] and (x.get('ref') or {}).get('id')==item['id'] and not _d37_done(x) and _d37_date(x.get('end') or x.get('start'))>=today.isoformat()]
+        reasons=[]
+        if not linked and not next_step:reasons.append('No next action recorded')
+        review=_d37_date(source.get('next_review'))
+        if review and review<today.isoformat():reasons.append('Recorded review date has passed')
+        elif not dates and not review:reasons.append('No upcoming milestone / review recorded')
+        if reasons:groups['attention'].append({**item,'reasons':reasons})
+    for item in groups['leads']+groups['tenders']:
+        source=_d37_get_entity(workspace,item)
+        for field,label in [('next_review','Review date'),('deadline','Recorded deadline'),('submission_deadline','Submission deadline')]:
+            due=_d37_date(source.get(field))
+            if due and due<=limit:groups['upcoming'].append({**item,'date':due,'date_label':label,'past_date':due<today.isoformat(),'context':False})
+    bookmarks=[];changes=[];reviewed=profile.get('reviewed_at','')
+    for ref in profile.get('bookmarks',[]):
+        x=_d37_get_entity(workspace,ref)
+        if x:
+            item=_d37_item(ref['type'],x);item['archived']=_d37_archived(x);bookmarks.append(item)
+            if item['updated'] and (not reviewed or item['updated']>reviewed):changes.append({**item,'change':'Record updated','at':item['updated']})
+        else:bookmarks.append({'type':ref['type'],'id':ref['id'],'name':'Unavailable bookmarked record','unavailable':True})
+    marked={(x['type'],x['id']) for x in bookmarks}
+    collection_type={v:k for k,v in _D37_COLLECTIONS.items()}
+    for event in workspace.get('history',[]):
+        typ=collection_type.get(event.get('entity'),event.get('entity'));rid=event.get('id');at=str(event.get('at') or '')
+        if (typ,rid) not in marked or not at or (reviewed and at<=reviewed):continue
+        if any(c['type']==typ and c['id']==rid and c['at']==at for c in changes):continue
+        changes.append({'type':typ,'id':rid,'name':str(event.get('title') or 'Bookmarked record'),'at':at,'change':str(event.get('change') or 'Recorded change')[:180]})
+    for name in groups:groups[name].sort(key=lambda x:((x.get('date') or '9999') if name in ('actions','upcoming') else _d37_norm(x['name'])))
+    return {'me':key,'target':target,'viewing_other':target!=key,'admin':identity['is_admin'],'profile':{k:profile.get(k) for k in ('id','name','email','aliases','access_level','last_confirmed','reviewed_at')},'groups':groups,'bookmarks':bookmarks,'changes':sorted(changes,key=lambda x:x['at'],reverse=True)[:40],'alias_conflicts':conflicts,'roster':[{k:p.get(k) for k in ('id','name','email','aliases','access_level','last_confirmed')} for p in roster] if identity['is_admin'] else [],'storage':'Azure shared desk preferences' if _usage36_shared() else 'Local development desk preferences','today':today.isoformat()}
+
+def _d37_preferences(h,body):
+    key,_,subject=_d37_identity(h)
+    if body.get('user') and body['user']!=key:raise PermissionError('Other users\' desk preferences are read-only, including for administrators.')
+    operation=body.get('operation');ref=body.get('ref')
+    if operation in ('bookmark','unbookmark'):
+        if not isinstance(ref,dict) or ref.get('type') not in _D37_COLLECTIONS or not isinstance(ref.get('id'),str) or len(ref['id'])>160:raise ValueError('Invalid bookmark.')
+        ref={'type':ref['type'],'id':ref['id']}
+        if operation=='bookmark' and not _d37_get_entity(state(),ref):raise ValueError('The selected record no longer exists.')
+    elif operation!='reviewed':raise ValueError('Unknown desk preference operation.')
+    def change(p):
+        if not p:raise ValueError('Register your desk first.')
+        if p.get('subject') and p['subject']!=subject:raise PermissionError('Desk identity binding does not match.')
+        if operation=='reviewed':p['reviewed_at']=dt.datetime.now(dt.timezone.utc).isoformat()
+        else:
+            refs=p.setdefault('bookmarks',[]);refs=[r for r in refs if r!=ref]
+            if operation=='bookmark':
+                if len(refs)>=200:raise ValueError('Maximum 200 bookmarks per desk.')
+                refs.append(ref)
+            p['bookmarks']=refs
+        return p
+    _d37_update(key,change);return {'ok':True}
+
+def _d37_roster_save(h,body):
+    _auth_require(h,ADMIN_ROLES)
+    email=_d37_norm(body.get('email'));name=str(body.get('name') or '').strip()
+    if not re.fullmatch(r'[^\s@]{1,150}@[^\s@]{1,100}\.[^\s@]{2,40}',email) or not name or len(name)>200:raise ValueError('A full name and valid sign-in email are required.')
+    aliases=body.get('aliases',[])
+    if not isinstance(aliases,list) or len(aliases)>20 or any(not isinstance(a,str) or len(a)>200 for a in aliases):raise ValueError('Use at most 20 exact saved-name aliases.')
+    key=_request_hashlib.sha256(('email:'+email).encode()).hexdigest()[:40];aliases=list(dict.fromkeys(a.strip() for a in aliases if a.strip()))
+    for other in _d37_roster():
+        if other['id']==key:continue
+        reserved={_d37_norm(other.get('name')),_d37_norm(other.get('email'))}|{_d37_norm(a) for a in other.get('aliases',[])}
+        if {_d37_norm(a) for a in aliases}&reserved:raise ValueError('An alias already belongs to another registered desk. Use an unambiguous saved name or email.')
+    def change(p):
+        p=p or {'id':key,'name':name,'email':email,'access_level':'pending','bookmarks':[],'reviewed_at':'','created':dt.datetime.now(dt.timezone.utc).isoformat()}
+        # Roster entries never grant Entra roles or edit workspace ownership.
+        if not p.get('subject'):p['name']=name
+        p['aliases']=aliases;return p
+    _d37_update(key,change);return {'ok':True,'id':key}
+
+# Concise source-grounded briefing: at most two pages, no AI/invented economics.
+def _d37_briefing(workspace,ident):
+    x=next((r for r in workspace.get('records',[]) if r.get('id')==ident),None)
+    if not x:raise ValueError('Opportunity not found.')
+    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,KeepTogether,PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from xml.sax.saxutils import escape
+    styles=getSampleStyleSheet();styles.add(ParagraphStyle(name='D37Title',fontName='Helvetica-Bold',fontSize=22,leading=26,textColor=colors.HexColor('#16334f'),spaceAfter=8))
+    styles.add(ParagraphStyle(name='D37Body',fontSize=9,leading=13,textColor=colors.HexColor('#263e54'),spaceAfter=5))
+    styles.add(ParagraphStyle(name='D37Small',fontSize=7.5,leading=10,textColor=colors.HexColor('#64798d')))
+    styles.add(ParagraphStyle(name='D37Head',fontName='Helvetica-Bold',fontSize=11,leading=15,textColor=colors.HexColor('#146fc1'),spaceBefore=11,spaceAfter=5))
+    shortened=[False]
+    def text(value,limit=420):
+        if value is None or value=='':return 'Not recorded'
+        if isinstance(value,(dict,list)):value=json.dumps(value,ensure_ascii=False)
+        s=re.sub(r'\s+',' ',str(value)).strip()
+        if len(s)>limit:s=s[:limit].rsplit(' ',1)[0]+'...';shortened[0]=True
+        return s
+    def p(value,style='D37Body',limit=420):return Paragraph(escape(text(value,limit)),styles[style])
+    def heading(title):return p(title,'D37Head')
+    def section(title,value,limit=420):return [KeepTogether([heading(title),p(value,limit=limit)])]
+    def optional(title,value,limit=420):return section(title,value,limit) if value else []
+    def facts(rows):
+        cells=[]
+        for a,b in rows:cells.append([p(a,'D37Small',80),p(b,limit=180)])
+        t=Table(cells,colWidths=[118,389],hAlign='LEFT');t.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('BACKGROUND',(0,0),(0,-1),colors.HexColor('#edf4fc')),('ROWBACKGROUNDS',(1,0),(-1,-1),[colors.HexColor('#f7f9fc'),colors.white]),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6),('LEFTPADDING',(0,0),(-1,-1),9)]));return t
+    linked_actions=[a for a in workspace.get('actions',[]) if (a.get('ref') or {})=={'type':'lead','id':ident} and not _d37_done(a)]
+    linked_actions.sort(key=lambda a:(str(a.get('due') or '9999'),_d37_name(a)))
+    milestones=[m for m in workspace.get('milestones',[]) if (m.get('ref') or {})=={'type':'lead','id':ident} and not _d37_done(m)]
+    milestones.sort(key=lambda m:str(m.get('end') or m.get('start') or '9999'))
+    stage=x.get('workflow_stage') or x.get('stage') or 'Not recorded';status='Archived' if _d37_archived(x) else 'Current contract' if _d37_current(x) else 'Qualified lead' if (x.get('qualification') or {}).get('verified') is True else 'Lead'
+    story=[p('OPPORTUNITY BRIEFING','D37Small'),p(x.get('name'),'D37Title',120),p(status+' | '+str(stage)+' | Saved information only','D37Small'),Spacer(1,10)]
+    story.append(facts([('Counterpart / geography',' / '.join(str(x.get(k)) for k in ('counterpart','country','region') if x.get(k)) or None),('People',' | '.join(label+': '+str(x[k]) for label,k in [('Owner','owner'),('Peer','peer'),('Portfolio','analyst')] if x.get(k)) or None),('Commercial terms',' | '.join(str(x.get(k)) for k in ('side','delivery','tenor','pricing') if x.get(k)) or None)]))
+    story+=section('The opportunity',x.get('summary') or x.get('notes'),520)
+    story+=section('Why pursue it?',x.get('rationale'),380)
+    story+=section('Decision / next step',x.get('decision_required') or x.get('next_step') or x.get('next_action') or (('Next recorded action: '+_d37_name(linked_actions[0])) if linked_actions else None),300)
+    plan=[]
+    for a in linked_actions[:2]:plan.append('Action: '+_d37_name(a)+' | '+str(a.get('owner') or 'Owner not recorded')+' | Due '+str(a.get('due') or 'not recorded'))
+    for m in milestones[:2]:plan.append('Milestone: '+_d37_name(m)+' | '+str(m.get('end') or m.get('start') or 'Date not recorded')+' | '+str(m.get('status') or 'Status not recorded'))
+    story+=section('Near-term plan','; '.join(plan) or None,520)
+    context=[]
+    valuation=copy.deepcopy(x.get('valuation')) if isinstance(x.get('valuation'),dict) else {};metrics=[]
+    legacy_unit=str(x.get('valuation_unit') or '').strip()
+    legacy_key='total_npv_usd' if legacy_unit in ('USD','$') else 'npv_per_mmbtu' if legacy_unit=='$/MMBtu' else ''
+    if legacy_key and legacy_key not in valuation and x.get('npv') not in (None,''):valuation[legacy_key]=x['npv']
+    for k,label,unit in [('total_npv_usd','Total NPV','USD'),('npv_per_mmbtu','NPV','USD/MMBtu'),('portfolio_value_usd','Portfolio value','USD'),('portfolio_value_per_mmbtu','Portfolio value','USD/MMBtu')]:
+        v=valuation.get(k)
+        if v is not None and v!='':metrics.append((label,((f'{v:,.3f}'.rstrip('0').rstrip('.')) if isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) else str(v))+' '+unit))
+    if metrics:context.append(KeepTogether([heading('Recorded economics'),facts(metrics[:4]),p('Stored values only; not recalculated or added together. Valuation date: '+text(valuation.get('valuation_date') or 'not recorded',60),'D37Small')]))
+    context+=optional('Key assumptions',valuation.get('key_assumptions') or x.get('assumptions'),400)
+    context+=optional('Risks / questions to resolve',x.get('open_questions') or x.get('risks'),460)
+    needs=[]
+    # Use explicit saved links only, never inferred matches.
+    refs=[]
+    if isinstance(x.get('source_ref'),dict):refs.append(x['source_ref'])
+    for link in workspace.get('links',[]):
+        a=link.get('from') or link.get('a') or link.get('source');b=link.get('to') or link.get('b') or link.get('target')
+        if a=={'type':'lead','id':ident} and isinstance(b,dict):refs.append(b)
+        if b=={'type':'lead','id':ident} and isinstance(a,dict):refs.append(a)
+    for key in ('need_id','portfolio_need_id'):
+        if x.get(key):refs.append({'type':'need','id':x[key]})
+    for nid in x.get('linked_need_ids',[]) or []:refs.append({'type':'need','id':nid})
+    source=[]
+    for ref in refs:
+        entity=_d37_get_entity(workspace,ref)
+        if entity:
+            if ref.get('type')=='need':needs.append(_d37_name(entity))
+            elif ref.get('type') in ('insight','idea'):source.append(_d37_name(entity)+': '+str(entity.get('observation') or entity.get('summary') or entity.get('implication') or ''))
+    context+=optional('Linked portfolio need','; '.join(dict.fromkeys(needs)) or None,280)
+    context+=optional('Market input / origin','; '.join(dict.fromkeys(source)) or (x.get('source_context') or {}).get('title'),340)
+    interactions=[]
+    for c in workspace.get('communications',[]):
+        refs=c.get('linked_deals',[]) or []
+        if c.get('lead_id')==ident or ident in (c.get('linked_lead_ids') or []) or any(r.get('type')=='lead' and r.get('id')==ident for r in refs if isinstance(r,dict)):interactions.append(c)
+    interactions.sort(key=lambda c:str(c.get('date') or c.get('updated') or ''),reverse=True)
+    lines=[str(c.get('date') or '')+' | '+_d37_name(c)+': '+str(c.get('summary') or c.get('notes') or c.get('outcome') or '') for c in interactions[:2]]
+    context+=optional('Latest linked conversations','; '.join(lines) or None,420)
+    if context:story.extend([Spacer(1,5)]+context)
+    story.extend([Spacer(1,10),p('Concise extract: long fields and linked lists may be shortened. Open the workspace record for full detail. Missing fields are not inferred. This briefing is not an approval or valuation.','D37Small')])
+    out=io.BytesIO()
+    def footer(canvas,doc):
+        canvas.setStrokeColor(colors.HexColor('#d5e3ef'));canvas.line(44,37,A4[0]-44,37);canvas.setFillColor(colors.HexColor('#64798d'));canvas.setFont('Helvetica',7)
+        canvas.drawString(44,25,'LNG ORI Workspace | '+dt.datetime.now(dt.timezone.utc).strftime('%d %b %Y %H:%M UTC'));canvas.drawRightString(A4[0]-44,25,str(doc.page))
+    SimpleDocTemplate(out,pagesize=A4,leftMargin=44,rightMargin=44,topMargin=34,bottomMargin=49,title='Opportunity briefing',author='LNG ORI Workspace').build(story,onFirstPage=footer,onLaterPages=footer)
+    return out.getvalue(),'opportunity_briefing_'+re.sub(r'[^A-Za-z0-9_-]','_',_d37_name(x))[:70]+'.pdf'
+
+_D37_GET=Handler.do_GET
+_D37_POST=Handler.do_POST
+
+def _d37_get(h):
+    path=urlparse(h.path).path
+    if path not in ('/api/desk','/api/opportunity-briefing.pdf'):return _D37_GET(h)
+    try:
+        if not h.host_ok():raise PermissionError('Invalid host.')
+        _auth_require(h,WRITE_ROLES if path=='/api/desk' else READ_ROLES)
+        q=_ext_qs(urlparse(h.path).query)
+        if path=='/api/desk':h.send(200,_d37_summary(h,q.get('user',[''])[0]))
+        else:
+            try:raw,name=_d37_briefing(state(),q.get('id',[''])[0])
+            except ImportError:h.send(503,{'error':'PDF export requires reportlab in requirements-radix.txt.'});return
+            _ext_binary(h,raw,'application/pdf',name)
+    except PermissionError as e:h.send(403,{'error':str(e)})
+    except (ValueError,TypeError) as e:h.send(400,{'error':str(e)})
+    except Exception:h.send(503,{'error':'The desk or briefing is temporarily unavailable. Existing workspace features are unaffected. Please retry.'})
+
+def _d37_post(h):
+    path=urlparse(h.path).path
+    if path not in ('/api/desk/register','/api/desk/preferences','/api/desk/roster'):return _D37_POST(h)
+    try:
+        if not h.host_ok() or not h.origin_ok(h.headers.get('Origin')) or not _valid_request_token(h.headers.get('X-ORI-Token')):raise PermissionError('Invalid request. Reload the app.')
+        _auth_require(h,ADMIN_ROLES if path.endswith('/roster') else WRITE_ROLES)
+        length=int(h.headers.get('Content-Length','0'))
+        if not 0<length<=16000:raise ValueError('Invalid desk payload size.')
+        body=json.loads(h.rfile.read(length))
+        if not isinstance(body,dict):raise ValueError('Invalid desk request.')
+        if path.endswith('/register'):
+            p=_d37_register(h);h.send(200,{'ok':True,'id':p['id'],'bookmarks':p.get('bookmarks',[])})
+        elif path.endswith('/preferences'):h.send(200,_d37_preferences(h,body))
+        else:h.send(200,_d37_roster_save(h,body))
+    except PermissionError as e:h.send(403,{'error':str(e)})
+    except (ValueError,TypeError) as e:h.send(400,{'error':str(e)})
+    except Exception:h.send(503,{'error':'Desk preferences storage is unavailable. No workspace records have been changed.'})
+
+Handler.do_GET=_d37_get
+Handler.do_POST=_d37_post
+_USAGE36_PAGES['desk']='My Desk'
+
+_D37_UI='<style>\n/* V37 new components only. No existing page styles are overridden. */\n.d37{--d37-blue:#3984ff;--d37-teal:#14b8a6;--d37-purple:#a27af5;--d37-gold:#efb84d;max-width:1700px;margin:auto}.d37-hero{display:flex;justify-content:space-between;align-items:center;gap:20px;border-radius:22px;padding:28px 30px;background:linear-gradient(115deg,#123250,#214f78 58%,#454383);color:#fff;box-shadow:0 14px 34px #071a3022;position:relative;overflow:hidden}.d37-hero:after{content:\'\';position:absolute;width:230px;height:230px;right:160px;top:-135px;border:35px solid #ffffff08;border-radius:50%;pointer-events:none}.d37-eyebrow{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#a4d9ff}.d37-hero h1{color:#fff;font-size:31px;margin:6px 0}.d37-hero p{font-size:13px;color:#d1e2f3;margin:0}.d37-hero .d37-actions{position:relative;z-index:1}.d37-hero button{color:#fff;border-color:#ffffff40;background:#ffffff12}.d37-hero button:hover{background:#ffffff25}.d37-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.d37-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:18px 0}.d37-stat{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:18px;position:relative;overflow:hidden}.d37-stat:before{content:\'\';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--tone)}.d37-stat small{font-size:11px}.d37-stat strong{display:block;font-size:29px;line-height:1.2;margin:9px 0;color:var(--text)}.d37-stat span{font-size:11px;color:var(--muted)}.d37-grid{display:grid;grid-template-columns:1.35fr 1fr;gap:16px;margin-bottom:16px}.d37-panel{border:1px solid var(--line);border-radius:16px;background:var(--panel);padding:21px;min-width:0}.d37-panel h2{font-size:17px;margin:0}.d37-panel p.d37-sub{font-size:11px;color:var(--muted);margin:4px 0 16px}.d37-panel-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px}.d37-count{font-size:11px;border-radius:20px;background:var(--soft);color:var(--muted);padding:4px 9px;white-space:nowrap}.d37-list{display:grid;gap:9px}.d37-item{border:1px solid var(--line);border-radius:11px;padding:12px 13px;background:var(--bg);min-width:0;display:flex;align-items:start;gap:10px;justify-content:space-between}.d37-item-main{min-width:0;flex:1}.d37-item button.d37-link{display:block;background:none;border:0;min-height:0;padding:0;text-align:left;font-size:13px;font-weight:600;line-height:1.5;color:var(--text);overflow-wrap:anywhere}.d37-item button.d37-link:hover{color:var(--blue)}.d37-item small{display:block;font-size:10px;margin-top:4px;overflow-wrap:anywhere}.d37-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.d37-tag{font-size:9px;padding:3px 7px;border-radius:12px;background:#3984ff18;color:var(--blue);border:1px solid #3984ff25}.d37-tag.teal{background:#14b8a617;color:var(--green);border-color:#14b8a633}.d37-tag.gold{background:#efb84d17;color:var(--gold);border-color:#efb84d33}.d37-tag.purple{background:#a27af517;color:var(--purple);border-color:#a27af533}.d37-mini{font-size:11px!important;min-height:28px!important;padding:4px 8px!important;white-space:nowrap}.d37-empty{border:1px dashed var(--line);border-radius:11px;padding:23px 16px;color:var(--muted);font-size:12px;text-align:center}.d37-note{padding:12px 15px;border-radius:10px;background:var(--soft);font-size:11px;color:var(--muted);margin:14px 0;line-height:1.7}.d37-note.viewing{border-left:3px solid var(--d37-purple)}.d37-roster{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}.d37-person{border:1px solid var(--line);background:var(--bg);border-radius:12px;padding:13px;display:flex;gap:11px;align-items:center;min-width:0;text-align:left;justify-content:start}.d37-person:hover{border-color:var(--d37-blue);background:var(--soft)}.d37-person.active{border-color:var(--d37-purple);box-shadow:inset 0 0 0 1px var(--d37-purple)}.d37-avatar{display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:12px;background:linear-gradient(135deg,#3984ff2b,#a27af52b);color:var(--blue);font-size:13px;font-weight:700}.d37-person b{font-size:12px;display:block;overflow-wrap:anywhere}.d37-person small{font-size:10px;display:block;overflow-wrap:anywhere}.d37-roster-panel{margin-bottom:17px}.d37-form{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}.d37-form label{display:grid;gap:5px;font-size:11px;color:var(--muted);margin:0}.d37-form input,.d37-form textarea,.d37-form select,.d37-search,.d37-bookmark-select{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:8px;padding:9px;font-size:12px}.d37-form textarea{min-height:75px}.d37-full{grid-column:1/-1}.d37-search{margin:0 0 12px;max-width:400px}.d37-bookmark-select{max-width:100%;margin:8px 0}.d37-footer{font-size:10px;color:var(--muted);margin:18px 0}.d37-error{border:1px solid #d26a85;background:#d26a8510;border-radius:12px;padding:18px;color:var(--red);font-size:13px}.d37-briefbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;padding:11px 14px;border:1px solid var(--line);border-left:3px solid #a27af5;border-radius:10px;background:var(--panel);margin:12px 0 16px}.d37-briefbar label{font-size:11px;color:var(--muted);margin:0}.d37-briefbar select{max-width:440px;min-width:180px;flex:1;padding:8px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);font-size:12px}.d37-briefbar button{font-size:12px;min-height:35px}.d37-briefbar small{font-size:10px}.d37-row-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}.d37-dialog{position:fixed;inset:0;background:#061727a8;z-index:2000;display:grid;place-items:center;padding:18px}.d37-dialog>section{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:17px;width:min(620px,96vw);max-height:90vh;overflow:auto;padding:25px}.d37-dialog h2{margin:0}.d37-dialog p{font-size:12px;color:var(--muted)}\n@media(max-width:1100px){.d37-grid{grid-template-columns:1fr}.d37-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.d37-hero{padding:21px;align-items:start;flex-direction:column}.d37-hero h1{font-size:25px}.d37-panel{padding:15px}.d37-form{grid-template-columns:1fr}.d37-stat{padding:14px}.d37-stats{gap:8px}}\n</style>\n<script>\nconst D37={data:null,target:\'\',request:0,registration:null,booted:false,initialHash:window.__d37InitialHash??location.hash,bookmarks:[],ownId:\'\',filter:\'all\',lastRevision:null};\nfunction d37Allowed(){return !!(typeof ORI_MODE!==\'undefined\'&&ORI_MODE.identity?.can_write)}\nfunction d37Nav(){\n const host=$(\'nav\');if(!host)return;let b=$(\'d37Nav\');\n if(d37Allowed()){if(!b){b=document.createElement(\'button\');b.id=\'d37Nav\';b.dataset.page=\'desk\';b.innerHTML=\'<span class="ico" aria-hidden="true">◈</span><span class="word">My Desk</span>\';b.onclick=()=>{D37.target=\'\';D37.data=null;go(\'desk\')};host.prepend(b)}b.classList.toggle(\'active\',route.page===\'desk\')}\n else if(b)b.remove();\n}\nconst d37OldNav=nav;nav=function(...args){const result=d37OldNav(...args);d37Nav();return result};\nfunction d37Boot(){\n if(!S||!ORI_MODE.identity)return;\n if(!D37.booted){D37.booted=true;if(d37Allowed()&&(!D37.initialHash||D37.initialHash===\'#desk\')){route={page:\'desk\',ref:null,tab:\'Overview\'};history.replaceState(copy(route),\'\',\'#desk\')}else if(D37.initialHash===\'#desk\'){route={page:\'desk\',ref:null,tab:\'Overview\'}}}\n if(d37Allowed()&&!D37.registration){D37.registration=api(\'/api/desk/register\',{}).then(r=>{D37.ownId=r.id;D37.bookmarks=r.bookmarks||D37.bookmarks;document.querySelectorAll(\'[data-d37-star]\').forEach(b=>{const key=b.dataset.d37Star;const cut=key.indexOf(\':\');b.outerHTML=d37Star(key.slice(0,cut),key.slice(cut+1))});return r}).catch(e=>{D37.registration=null;throw e});D37.registration.catch(()=>{})}\n}\nconst d37OldRender=render;render=function(...args){\n d37Boot();\n if(route.page===\'desk\'&&!route.ref){if(D37.lastRevision!==null&&D37.lastRevision!==S?.revision)D37.data=null;theme();nav();if(!d37Allowed()){$(\'page\').innerHTML=\'<div class="notice">My Desk is available to Writers and Administrators only.</div>\';return}d37Render();if(typeof u36Observe===\'function\')u36Observe();return}\n const result=d37OldRender(...args);d37Decorate();return result;\n};\nconst d37OldPaint=oriModePaint;oriModePaint=function(...args){const r=d37OldPaint(...args);d37Nav();if(S&&!D37.booted&&ORI_MODE.identity)queueMicrotask(()=>render());return r};\nfunction d37Label(x){return x.type===\'lead\'?(x.current?\'Contract\':x.qualified?\'Qualified lead\':\'Lead\'):({tender:\'Tender\',counterpart:\'Counterpart\',need:\'Portfolio need\',insight:\'Insight\',idea:\'Idea\',action:\'Action\',milestone:\'Milestone\'})[x.type]||x.type}\nfunction d37Open(type,id){\n if(type===\'counterpart\'){xopenCP(id);return}\n if(type===\'tender\'){dev21OpenTender(id);return}\n if(type===\'action\'||type===\'milestone\'){const item=(S[type===\'action\'?\'actions\':\'milestones\']||[]).find(x=>x.id===id);if(item?.ref){openRecord(item.ref.type,item.ref.id);if(item.ref.type===\'lead\')tab(\'Plan & dates\');return}edit(type,id);return}\n openRecord(type,id);\n}\nfunction d37Bookmarked(type,id){return D37.bookmarks.some(r=>r.type===type&&r.id===id)}\nfunction d37Star(type,id){if(!d37Allowed())return \'\';const saved=d37Bookmarked(type,id);return `<button type="button" class="small d37-mini" data-d37-star="${E(type+\':\'+id)}" onclick="event.stopPropagation();d37Bookmark(${J(type)},${J(id)},${saved?\'false\':\'true\'})" title="${saved?\'Remove from\':\'Bookmark on\'} your My Desk">${saved?\'★ Saved\':\'☆ Bookmark\'}</button>`}\nasync function d37Bookmark(type,id,add=true){\n try{d37Boot();await D37.registration;await api(\'/api/desk/preferences\',{operation:add?\'bookmark\':\'unbookmark\',ref:{type,id}});D37.bookmarks=D37.bookmarks.filter(x=>!(x.type===type&&x.id===id));if(add)D37.bookmarks.push({type,id});if(route.page===\'desk\'&&!D37.target){D37.data=null;d37Load()}else{document.querySelectorAll(\'[data-d37-star]\').forEach(b=>{if(b.dataset.d37Star===type+\':\'+id)b.outerHTML=d37Star(type,id)})}toast(add?\'Bookmarked on your My Desk.\':\'Bookmark removed.\')}\n catch(e){toast(e.message)}\n}\nfunction d37Item(x,options={}){\n const date=x.date?`<span class="d37-tag ${x.past_date?\'gold\':\'teal\'}">${x.date_label?E(x.date_label)+\' · \':\'\'}${E(x.date)}${x.past_date?\' · past recorded date\':\'\'}</span>`:\'\';\n return `<article class="d37-item"><div class="d37-item-main">${x.unavailable?`<b>${E(x.name)}</b>`:`<button class="d37-link" onclick="d37Open(${J(x.type)},${J(x.id)})">${E(x.name)}</button>`}<small>${E([x.counterpart,x.stage].filter(Boolean).join(\' · \')||d37Label(x))}</small><div class="d37-tags"><span class="d37-tag">${E(d37Label(x))}</span>${(x.roles||[]).map(r=>`<span class="d37-tag purple">${E(r)}</span>`).join(\'\')}${date}${x.context?\'<span class="d37-tag purple">Project context, not your assignment</span>\':\'\'}${x.archived?\'<span class="d37-tag gold">Archived</span>\':\'\'}</div>${x.reasons?`<small>${x.reasons.map(E).join(\' · \')}</small>`:\'\'}${x.change?`<small>${E(x.change)} · ${E((x.at||\'\').slice(0,16).replace(\'T\',\' \'))} UTC</small>`:\'\'}</div><div class="d37-actions">${options.remove&&!D37.data?.viewing_other?`<button class="small d37-mini" onclick="d37Bookmark(${J(x.type)},${J(x.id)},false)" aria-label="Remove bookmark">×</button>`:\'\'}${x.type===\'lead\'&&options.brief?`<button class="small d37-mini" onclick="d37Brief(${J(x.id)})">PDF brief</button>`:\'\'}</div></article>`;\n}\nfunction d37List(items,options={}){return items.length?\'<div class="d37-list">\'+items.map(x=>d37Item(x,options)).join(\'\')+\'</div>\':\'<div class="d37-empty">\'+E(options.empty||\'Nothing recorded for this selection.\')+\'</div>\'}\nfunction d37Panel(title,items,sub=\'\',options={}){return `<section class="d37-panel"><div class="d37-panel-head"><h2>${title}</h2><span class="d37-count">${items.length}</span></div>${sub?`<p class="d37-sub">${E(sub)}</p>`:\'\'}${d37List(items,options)}</section>`}\nfunction d37Stat(label,n,note,tone){return `<article class="d37-stat" style="--tone:${tone}"><small>${label}</small><strong>${n}</strong><span>${note}</span></article>`}\nfunction d37Initials(name){return String(name||\'\').split(/\\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join(\'\').toUpperCase()}\nfunction d37Roster(d){\n if(!d.admin)return \'\';\n return `<section class="d37-panel d37-roster-panel"><div class="d37-panel-head"><div><h2>Writer desks</h2><p class="d37-sub" style="margin-bottom:0">Open a colleague\'s desk. Their personal bookmarks remain read-only.</p></div><button class="small" onclick="d37RosterDialog()">Register / map writer</button></div><input class="d37-search" aria-label="Find writer desk" placeholder="Find a writer by name or email..." oninput="d37RosterFilter(this.value)"><div class="d37-roster" id="d37RosterCards">${d.roster.map(p=>`<button class="d37-person ${d.target===p.id?\'active\':\'\'}" data-d37-person="${E((p.name+\' \'+p.email).toLowerCase())}" onclick="d37View(${J(p.id)})"><span class="d37-avatar">${E(d37Initials(p.name))}</span><span><b>${E(p.name)}${p.id===d.me?\' · You\':\'\'}</b><small>${E(p.email||\'\')}</small><small>${p.access_level===\'pending\'?\'Pre-registered · role not yet confirmed\':p.access_level===\'admin\'?\'Administrator\':\'Writer\'}</small></span></button>`).join(\'\')}</div><details style="margin-top:12px"><summary style="font-size:11px;cursor:pointer;color:var(--muted)">Roster coverage and name mapping</summary><div class="d37-note">Writers/Admins are registered when they open this version. To include someone before their first visit, register their exact sign-in email here. This is an app roster, not a live Entra directory. Registration never grants access. Use exact saved-name aliases to connect legacy owner fields; ambiguous names are excluded, not guessed. Existing ownership fields are never changed.</div></details></section>`;\n}\nfunction d37RosterFilter(q){for(const b of document.querySelectorAll(\'[data-d37-person]\'))b.hidden=!b.dataset.d37Person.includes(q.toLowerCase())}\nfunction d37Render(){\n if(!D37.data||D37.data.target!==(D37.target||D37.ownId)){$(\'page\').innerHTML=\'<div class="d37"><header class="d37-hero"><div><div class="d37-eyebrow">Your commercial command centre</div><h1>My Desk</h1><p>Bringing your opportunities and next steps together.</p></div></header><div id="d37Loading" class="d37-note">Loading your desk...</div></div>\';d37Load();return}\n const d=D37.data,g=d.groups,p=d.profile,own=!d.viewing_other;\n $(\'page\').innerHTML=`<div class="d37">${d37Roster(d)}<header class="d37-hero"><div><div class="d37-eyebrow">${own?\'Your commercial command centre\':\'Administrator · colleague desk view\'}</div><h1>${own?\'My Desk\':E(p.name)+"\'s Desk"}</h1><p>${E(p.name)} · Your opportunities, recorded commitments and next steps in one place.</p></div><div class="d37-actions">${!own?\'<button onclick="d37View(\\\'\\\')">Back to my desk</button>\':\'\'}<button onclick="d37Refresh()">Refresh desk</button>${own?\'<button onclick="d37BookmarkDialog()">☆ Add bookmark</button>\':\'\'}${d.admin?`<button onclick="d37RosterDialog(${J(p.id)})">Name mapping</button>`:\'\'}</div></header>\n ${!own?\'<div class="d37-note viewing">You are viewing another user\\\'s desk as Administrator. Bookmark and review preferences cannot be changed here. Opening shared records uses your existing workspace rights.</div>\':\'\'}\n ${d.alias_conflicts.length?`<div class="d37-note viewing">Ambiguous saved names were excluded: ${d.alias_conflicts.map(E).join(\', \')}. Use an unambiguous alias or email mapping.</div>`:\'\'}\n <div class="d37-stats">${d37Stat(\'Active leads\',g.leads.length,g.leads.filter(x=>x.qualified).length+\' explicitly qualified\',\'#3984ff\')}${d37Stat(\'Tenders\',g.tenders.length,\'Assigned to this desk\',\'#14b8a6\')}${d37Stat(\'Open actions\',g.actions.length,\'Direct assignments only\',\'#a27af5\')}${d37Stat(\'Next-step checks\',g.attention.length,\'Missing recorded actions / review dates\',\'#efb84d\')}</div>\n <div class="d37-grid">${d37Panel(\'Your action list\',g.actions,\'Existing open actions assigned to this user. Open an item to follow up in its existing record.\',{empty:\'No open actions are currently assigned to this desk.\'})}${d37Panel(\'Upcoming & past recorded dates\',g.upcoming,\'Next 30 days plus past open dates. Project-context dates are labelled separately; past dates do not prove work is overdue.\')}</div>\n <div class="d37-grid">${d37Panel(\'Opportunities to develop\',g.leads,\'Owner, peer, portfolio-analysis and explicitly recorded responsibility matches.\',{brief:true,empty:\'No active leads match the saved identity or aliases.\'})}${d37Panel(\'Needs a next step\',g.attention,\'Record-completeness checks, not a judgement about work or progress.\')}</div>\n <div class="d37-grid">${d37Panel(\'Your tenders\',g.tenders,\'Standalone tenders retain their existing workflow.\')}${d37Panel(\'Your counterpart relationships\',g.counterparts,\'Matched to the saved responsible / owner fields.\')}</div>\n <div class="d37-grid"><section class="d37-panel"><div class="d37-panel-head"><h2>Bookmarked for follow-up</h2><span class="d37-count">${d.bookmarks.length}</span></div><p class="d37-sub">${own?\'Your personal saved records.\':\'This user\\\'s saved records, read-only.\'}</p>${d37List(d.bookmarks,{remove:true,empty:\'Bookmark records you want to keep close at hand.\'})}</section><section class="d37-panel"><div class="d37-panel-head"><h2>Changed since last review</h2>${own?\'<button class="small" onclick="d37Reviewed()">Mark reviewed</button>\':\'\'}</div><p class="d37-sub">Saved updates to bookmarked records only. ${p.reviewed_at?\'Last reviewed \'+E(p.reviewed_at.slice(0,16).replace(\'T\',\' \'))+\' UTC.\':\'No review marker yet.\'}</p>${d37List(d.changes,{empty:\'No recorded bookmark updates since the last review.\'})}</section></div>\n <div class="d37-grid">${d37Panel(\'Your market inputs & portfolio needs\',g.inputs,\'Explicit saved owner / contributor matches.\')}${d37Panel(\'Your current contracts\',g.contracts,\'Existing contract records, not a separate contract workflow.\',{brief:true})}</div>\n <div class="d37-note">Personalisation uses exact saved names, email addresses and administrator-approved aliases. It does not infer ownership from browsing activity. Dates shown here are recorded app dates, not Outlook calendar events. Existing actions, qualification and shared records are reused without duplication.</div><div class="d37-footer">${E(d.storage)} · Desk preferences are separate from workspace records. Date checks use UTC.</div></div>`;\n}\nasync function d37Load(){\n if(!d37Allowed()||route.page!==\'desk\')return;const request=++D37.request;\n try{d37Boot();await D37.registration;const target=D37.target;const fresh=await api(\'/api/state\');if(request!==D37.request||route.page!==\'desk\')return;S=fresh;const data=await api(\'/api/desk\'+(target?\'?user=\'+encodeURIComponent(target):\'\'));if(request!==D37.request||route.page!==\'desk\')return;D37.data=data;D37.ownId=data.me;if(!data.viewing_other)D37.bookmarks=data.bookmarks.map(x=>({type:x.type,id:x.id}));D37.lastRevision=S?.revision;d37Render()}\n catch(e){if(request===D37.request&&route.page===\'desk\'){$(\'page\').innerHTML=`<div class="d37"><div class="d37-error">${E(e.message)}<p>Your existing workspace is unchanged.</p><button onclick="d37Refresh()">Retry desk</button><button onclick="go(\'overview\')">Open Overview</button></div></div>`}}\n}\nfunction d37View(id){D37.target=id===D37.ownId?\'\':id;D37.data=null;d37Render()}\nfunction d37Refresh(){D37.data=null;D37.registration=null;d37Boot();d37Render()}\nasync function d37Reviewed(){try{if(D37.data?.viewing_other)return;await api(\'/api/desk/preferences\',{operation:\'reviewed\'});D37.data=null;d37Load()}catch(e){toast(e.message)}}\nfunction d37Dialog(title,body){\n $(\'d37Dialog\')?.remove();const overlay=document.createElement(\'div\');overlay.id=\'d37Dialog\';overlay.className=\'d37-dialog d37\';overlay.innerHTML=`<section role="dialog" aria-modal="true" aria-labelledby="d37DialogTitle"><div class="d37-panel-head"><h2 id="d37DialogTitle">${E(title)}</h2><button class="small" onclick="d37CloseDialog()" aria-label="Close dialog">×</button></div>${body}</section>`;overlay.addEventListener(\'click\',e=>{if(e.target===overlay)d37CloseDialog()});document.body.appendChild(overlay);overlay._focus=document.activeElement;overlay.querySelector(\'input,select,button\')?.focus();return overlay;\n}\nfunction d37CloseDialog(){const host=$(\'d37Dialog\');const focus=host?._focus;host?.remove();focus?.focus?.()}\ndocument.addEventListener(\'keydown\',e=>{const host=$(\'d37Dialog\');if(!host)return;if(e.key===\'Escape\'){e.preventDefault();d37CloseDialog()}if(e.key===\'Tab\'){const nodes=[...host.querySelectorAll(\'button,input,select,textarea,[tabindex="0"]\')].filter(x=>!x.disabled&&!x.hidden);const first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus()}}});\nfunction d37BookmarkDialog(){\n const choices=[];for(const [type,col] of Object.entries({lead:\'records\',tender:\'tenders\',counterpart:\'counterparts\',need:\'needs\',insight:\'intelligence\',idea:\'ideas\'}))for(const x of S[col]||[])choices.push({type,id:x.id,name:x.name||x.title||\'Untitled\'});choices.sort((a,b)=>a.name.localeCompare(b.name));\n const host=d37Dialog(\'Bookmark a workspace record\',\'<p>Choose a shared record to add to your own desk. This does not change ownership or the record.</p><input class="d37-search" id="d37BookmarkSearch" placeholder="Search records" aria-label="Search records"><select class="d37-bookmark-select" id="d37BookmarkChoice" size="10" aria-label="Record to bookmark"></select><button class="primary" id="d37BookmarkAdd">Bookmark on my desk</button>\');\n const fill=()=>{const q=$(\'d37BookmarkSearch\').value.toLowerCase();$(\'d37BookmarkChoice\').innerHTML=choices.filter(x=>(x.name+\' \'+d37Label(x)).toLowerCase().includes(q)).map(x=>`<option value="${E(JSON.stringify({type:x.type,id:x.id}))}">${E(d37Label(x)+\': \'+x.name)}</option>`).join(\'\')};$(\'d37BookmarkSearch\').oninput=fill;fill();$(\'d37BookmarkAdd\').onclick=async()=>{const v=$(\'d37BookmarkChoice\').value;if(!v){toast(\'Select a record first.\');return}const ref=JSON.parse(v);await d37Bookmark(ref.type,ref.id,true);d37CloseDialog()};\n}\nfunction d37RosterDialog(id=\'\'){\n if(!oriModeIsAdmin())return;const p=D37.data?.roster.find(x=>x.id===id)||{};\n d37Dialog(\'Register writer / map saved names\',`<p>Use the person\'s exact sign-in email. This only creates a desk entry and name mapping; it never grants Writer or Administrator rights.</p><div class="d37-form"><label>Name<input id="d37RosterName" value="${E(p.name||\'\')}" maxlength="200"></label><label>Sign-in email<input id="d37RosterEmail" type="email" value="${E(p.email||\'\')}" ${p.email?\'readonly\':\'\'}></label><label class="d37-full">Exact saved-name aliases, one per line<textarea id="d37RosterAliases">${E((p.aliases||[]).join(\'\\n\'))}</textarea></label></div><p>Use aliases only for confirmed legacy owner names. Existing owner fields are not rewritten. A registered account\'s display name is refreshed from its authenticated identity.</p><div id="d37RosterError" class="error" role="alert"></div><button class="primary" id="d37RosterSave">Save desk mapping</button>`);\n $(\'d37RosterSave\').onclick=async()=>{const button=$(\'d37RosterSave\');button.disabled=true;try{await api(\'/api/desk/roster\',{name:$(\'d37RosterName\').value,email:$(\'d37RosterEmail\').value,aliases:$(\'d37RosterAliases\').value.split(\'\\n\').filter(x=>x.trim())});d37CloseDialog();D37.data=null;d37Load()}catch(e){if($(\'d37RosterError\'))$(\'d37RosterError\').textContent=e.message}finally{button.disabled=false}};\n}\nasync function d37Brief(id){\n try{const r=await fetch(\'/api/opportunity-briefing.pdf?id=\'+encodeURIComponent(id),{cache:\'no-store\'});if(!r.ok){const d=await r.json();throw Error(d.error||\'Briefing export failed\')}const blob=await r.blob(),url=URL.createObjectURL(blob),a=document.createElement(\'a\');a.href=url;a.download=\'opportunity_briefing_\'+String((S.records||[]).find(x=>x.id===id)?.name||\'lead\').replace(/[^a-zA-Z0-9_-]/g,\'_\').slice(0,70)+\'.pdf\';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000)}catch(e){toast(e.message)}\n}\nfunction d37Decorate(){\n const page=$(\'page\');if(!page||!S)return;\n if(!route.ref&&[\'leads\',\'qualified\'].includes(route.page)&&!$(\'d37Briefbar\')){\n  const xs=route.page===\'qualified\'?wfQualifiedLeads():leads();const bar=document.createElement(\'div\');bar.id=\'d37Briefbar\';bar.className=\'d37-briefbar\';bar.innerHTML=`<label for="d37BriefChoice">Opportunity briefing</label><select id="d37BriefChoice" aria-label="Choose opportunity for PDF briefing"><option value="">Choose a lead...</option>${xs.map(x=>`<option value="${E(x.id)}">${E(x.name||\'Untitled\')}</option>`).join(\'\')}</select><button type="button" onclick="const id=$(\'d37BriefChoice\').value;if(id)d37Brief(id);else toast(\'Choose an opportunity first.\')">Download PDF briefing</button><small>Concise saved facts · no AI or invented values</small>`;const head=page.querySelector(\'.pagehead,.x-head\');if(head)head.after(bar);else page.prepend(bar);\n }\n if(!route.ref&&[\'leads\',\'qualified\'].includes(route.page)){\n  for(const row of page.querySelectorAll(\'[data-open][data-type="lead"],tr[data-qualified-id]\')){\n   if(row.querySelector(\'.d37-row-actions\'))continue;const id=row.dataset.open||row.dataset.qualifiedId;if(!(S.records||[]).some(x=>x.id===id))continue;const cell=row.querySelector(\'td\');if(!cell)continue;const box=document.createElement(\'div\');box.className=\'d37-row-actions\';box.innerHTML=`<button type="button" class="small d37-mini" onclick="event.stopPropagation();d37Brief(${J(id)})">PDF briefing</button>${d37Star(\'lead\',id)}`;box.addEventListener(\'keydown\',e=>e.stopPropagation());cell.appendChild(box);\n  }\n }\n if(route.ref&&route.ref.type===\'lead\'&&!$(\'d37RecordTools\')){\n  const head=page.querySelector(\'.landing-header,.pagehead\');if(head){const tools=document.createElement(\'div\');tools.id=\'d37RecordTools\';tools.className=\'d37-briefbar\';tools.innerHTML=`<button onclick="d37Brief(${J(route.ref.id)})">Download PDF briefing</button>${d37Star(\'lead\',route.ref.id)}`;head.after(tools)}\n }\n}\n// Direct qualified-view refreshes do not always call the main render function.\nconst d37OldQualified=wfRenderQualified;wfRenderQualified=function(...args){const r=d37OldQualified(...args);d37Decorate();return r};\nconst d37OldList=list;list=function(...args){const r=d37OldList(...args);d37Decorate();return r};\nconst d37OldTender=dev21OpenTender;dev21OpenTender=function(id,...args){const r=d37OldTender(id,...args);if(d37Allowed()){const button=$(\'dev21TenderEdit\');if(button&&!button.parentElement.querySelector(\'[data-d37-tender]\')){const tools=document.createElement(\'div\');tools.dataset.d37Tender=\'1\';tools.className=\'d37-row-actions\';tools.innerHTML=d37Star(\'tender\',id);button.before(tools)}}return r};\nconst d37OldCP=xrenderCP;xrenderCP=function(...args){const r=d37OldCP(...args);if(d37Allowed()&&XDEV.cp&&!$(\'d37CpBookmark\')){const head=$(\'page\').querySelector(\'.x-head,.pagehead\');if(head){const tools=document.createElement(\'div\');tools.id=\'d37CpBookmark\';tools.className=\'d37-row-actions\';tools.innerHTML=d37Star(\'counterpart\',XDEV.cp);head.after(tools)}}return r};\n// Small scoped observer decorates existing asynchronous views without re-rendering them.\nlet d37Pending=false;new MutationObserver(()=>{if(d37Pending)return;d37Pending=true;requestAnimationFrame(()=>{d37Pending=false;if(route.page!==\'desk\')d37Decorate()})}).observe($(\'page\'),{childList:true,subtree:true});\nd37Nav();if(S&&ORI_MODE.identity)queueMicrotask(()=>render());\n</script>\n'
+HTML=HTML.replace('<head>','<head><script>window.__d37InitialHash=location.hash;</script>',1).replace('</body>',_D37_UI+'</body>')
+_V28_PREVIEW_HTML=HTML.replace('<head>','<head>'+_V28_PREVIEW_BOOT,1).replace('</body>',_V28_PREVIEW_END+'</body>')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
