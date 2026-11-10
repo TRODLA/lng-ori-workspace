@@ -4140,6 +4140,121 @@ def _t43_get(h):
 Handler.do_GET=_t43_get
 
 
+
+# V44: unified opportunities, Trading responsibility and standalone event calendar.
+# All writes still use the existing authenticated, revision-aware workspace save.
+_V44_SEED_EVENTS = [
+ ('india-energy-week','India Energy Week','Kolkata, India','2027-01-28','2027-01-31','day'),
+ ('ceraweek','CERAWeek','Houston, USA','2027-03-08','2027-03-12','day'),
+ ('sia-china','SIA (China)','Beijing, China','2027-04-01','2027-04-30','month'),
+ ('lng-americas','LNG Americas (LNGA)','Singapore','2027-04-01','2027-04-30','month'),
+ ('flame','FLAME','Amsterdam, Netherlands','2027-04-20','2027-04-22','day'),
+ ('lng-gathering','LNG Gathering','Stavanger, Norway','2027-05-18','2027-05-21','day'),
+ ('japan-energy','Japan Energy Summit & Exhibition','Tokyo, Japan','2027-05-26','2027-05-28','day'),
+ ('ipa-convex','IPA Convex','Jakarta, Indonesia','2027-05-26','2027-05-28','day'),
+ ('wood-mackenzie','Gas, LNG & The Future of Energy (Wood Mackenzie)','London, UK','2027-06-23','2027-06-24','day'),
+ ('gastech','Gastech','Houston, USA','2027-09-01','2027-09-30','month'),
+ ('siew','Singapore International Energy Week (SIEW)','Singapore','2027-10-01','2027-10-31','month'),
+ ('giilng','GIILNG','To be confirmed','2027-01-01','2027-12-31','year'),
+]
+
+def _v44_migrate(value):
+    if not isinstance(value,dict):return value
+    n=copy.deepcopy(value)
+    if not isinstance(n.get('records'),list):return n
+    mapping=n.setdefault('unified_tender_ids',{})
+    legacy=n.setdefault('legacy_tenders',[])
+    existing={x.get('id') for x in n['records']}
+    for t in n.get('tenders',[]):
+        ident=t.get('id')
+        if not ident:continue
+        if ident not in mapping:
+            target=ident if ident not in existing else 'legacy-tender-'+ident
+            while target in existing:target='legacy-'+target
+            mapping[ident]=target
+            lead=copy.deepcopy(t);lead.update(id=target,kind='lead',source_tender_id=ident)
+            lead.setdefault('lifecycle','Active');lead.setdefault('maturity','Qualification');lead.setdefault('stage','DGA')
+            n['records'].append(lead);existing.add(target)
+        if not any(x.get('id')==ident for x in legacy):legacy.append(copy.deepcopy(t))
+    n['tenders']=[]
+    def remap(obj):
+        if isinstance(obj,list):
+            for item in obj:remap(item)
+        elif isinstance(obj,dict):
+            if obj.get('type')=='tender' and obj.get('id') in mapping:obj.update(type='lead',id=mapping[obj['id']])
+            if obj.get('tender_id') in mapping:
+                obj.setdefault('legacy_tender_id',obj['tender_id'])
+                target=mapping[obj['tender_id']]
+                if not obj.get('lead_id'):obj['lead_id']=target
+                else:
+                    links=obj.setdefault('linked_lead_ids',[])
+                    if target not in links:links.append(target)
+                obj.pop('tender_id',None)
+            if isinstance(obj.get('linked_tender_ids'),list):
+                links=obj.setdefault('linked_lead_ids',[]);remaining=[]
+                for ident in obj['linked_tender_ids']:
+                    if ident in mapping:
+                        if mapping[ident] not in links:links.append(mapping[ident])
+                    else:remaining.append(ident)
+                obj['linked_tender_ids']=remaining
+            for item in list(obj.values()):remap(item)
+    # Recovery copies and history are deliberately not rewritten.
+    for key,items in n.items():
+        if key not in ('legacy_tenders','history','unified_tender_ids'):remap(items)
+    if 'calendar_events' not in n:
+        n['calendar_events']=[dict(id='calendar-2027-'+i,title=t,location=l,start=s,end=e,precision=p,category='Gathering' if i=='lng-gathering' else 'Conference',notes='User-supplied planning dates; exact dates to be confirmed.' if p!='day' else 'User-supplied planning dates.') for i,t,l,s,e,p in _V44_SEED_EVENTS]
+    return n
+
+_V44_NORMALISE=normalise
+def normalise(value):return _v44_migrate(_V44_NORMALISE(_v44_migrate(value)))
+
+_V44_WORKSPACE=_v28_workspace
+def _v28_workspace(value):
+    if isinstance(value,dict):
+        value=copy.deepcopy(value)
+        if isinstance(value.get('records'),list):value=_v44_migrate(value)
+        else:
+            for key in ('state','workspace'):
+                if isinstance(value.get(key),dict) and isinstance(value[key].get('records'),list):value[key]=_v44_migrate(value[key])
+    return _V44_WORKSPACE(value)
+
+_V44_VALIDATE=validate
+def validate(n):
+    _V44_VALIDATE(n)
+    events=n.get('calendar_events',[])
+    if not isinstance(events,list) or len(events)>10000:raise ValueError('Invalid calendar event collection (maximum 10,000).')
+    seen=set()
+    for event in events:
+        if not isinstance(event,dict):raise ValueError('Invalid calendar event.')
+        ident=event.get('id')
+        if not isinstance(ident,str) or not ident or len(ident)>200 or ident in seen:raise ValueError('Invalid or duplicate calendar event ID.')
+        seen.add(ident)
+        for key,limit in [('title',300),('location',500),('notes',10000)]:
+            text=event.get(key,'')
+            if not isinstance(text,str) or len(text)>limit:raise ValueError('Invalid calendar '+key+'.')
+        if not event.get('title','').strip():raise ValueError('Calendar event title is required.')
+        if event.get('category') not in ('Conference','Gathering','Team build','Event','Other'):raise ValueError('Invalid calendar event category.')
+        if event.get('precision') not in ('day','month','year'):raise ValueError('Invalid calendar date precision.')
+        try:
+            start=dt.date.fromisoformat(event['start']);end=dt.date.fromisoformat(event['end'])
+        except (ValueError,KeyError,TypeError):raise ValueError('Calendar dates must be valid ISO dates.')
+        if end<start or (end-start).days>3660:raise ValueError('Calendar end date must follow the start date (maximum ten years).')
+    for record in n.get('records',[]):
+        trading=(record.get('responsibilities') or {}).get('trading','')
+        if not isinstance(trading,str) or len(trading)>2000:raise ValueError('Invalid Trading responsibility.')
+
+_V44_SAVE=save
+def save(n,old):
+    n=copy.deepcopy(n)
+    before={e['id']:e for e in old.get('calendar_events',[])};after={e['id']:e for e in n.get('calendar_events',[])}
+    for ident in sorted(before.keys()|after.keys()):
+        a,b=before.get(ident),after.get(ident)
+        if a!=b:n.setdefault('history',[]).append({'at':now(),'entity':'calendar_events','id':ident,'title':(b or a).get('title',''),'change':'Calendar event created' if a is None else 'Calendar event deleted' if b is None else 'Calendar event updated','before':copy.deepcopy(a),'after':copy.deepcopy(b)})
+    return _V44_SAVE(n,old)
+
+_V44_UI='<style>\n.v44-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0}.v44-toolbar input{max-width:280px}.v44-year{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.v44-month{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;min-width:0}.v44-month h2{margin:0 0 10px}.v44-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px}.v44-day{position:relative;min-height:34px;padding:4px;border:1px solid transparent;background:var(--soft);border-radius:5px;cursor:pointer;color:var(--text);text-align:left}.v44-day:hover,.v44-day:focus-visible{border-color:var(--blue)}.v44-day.today{outline:2px solid var(--blue)}.v44-dots{display:flex;gap:2px;flex-wrap:wrap}.v44-dot{width:6px;height:6px;border-radius:50%;background:var(--event-color)}.v44-weekday{text-align:center;color:var(--muted);font-size:12px}.v44-event{display:block;width:100%;text-align:left;border:1px solid var(--line);border-left:4px solid var(--event-color);border-radius:7px;background:var(--soft);color:var(--text);padding:7px 9px;margin:6px 0;white-space:normal;overflow-wrap:anywhere}.v44-event small{display:block;color:var(--muted)}.v44-provisional{border-style:dashed}.v44-large .v44-day{min-height:110px}.v44-large .v44-day .v44-event{font-size:12px;padding:3px;margin:3px 0}.v44-legend{display:flex;gap:15px;flex-wrap:wrap;color:var(--muted);font-size:13px}.v44-legend span{border-left:4px solid var(--event-color);padding-left:7px}.v44-detail{border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px;background:var(--panel)}.v44-error{color:var(--red)}\n@media(max-width:1100px){.v44-year{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.v44-year{grid-template-columns:1fr}.v44-large{overflow-x:auto}.v44-large .v44-grid{min-width:700px}}\n</style>\n<script>\n// V44 is local to this workspace: no Graph permissions or new dependencies.\nconst V44={year:2027,month:0,view:\'year\',query:\'\',category:\'\',selected:null};\nconst V44_CATEGORIES=[\'Conference\',\'Gathering\',\'Team build\',\'Event\',\'Other\'];\nconst V44_COLORS={\'Conference\':\'#49a7ef\',\'Gathering\':\'#32bc9b\',\'Team build\':\'#b58aef\',\'Event\':\'#e6ac45\',\'Other\':\'#ef8198\'};\nfunction v44TradingSchema(){const fields=schema.lead;let f=fields.find(x=>x[0]===\'responsibilities.trading\');if(!f)f=[\'responsibilities.trading\',\'Trading\',\'text\',\'People & status\'];schema.lead=fields.filter(x=>x[0]!==\'responsibilities.trading\');const people=schema.lead.filter(x=>x[3]===\'People & status\');const anchor=people[3];const at=anchor?schema.lead.indexOf(anchor)+1:schema.lead.length;schema.lead.splice(at,0,f)}\nconst v44Edit=edit;edit=function(...args){v44TradingSchema();const result=v44Edit(...args);if(args[0]===\'lead\'&&editor){v44TradingSchema();const form=$(\'editForm\'),group=form?.querySelector(\'[data-section="People & status"] .formgrid\');if(group){let label=$(\'f_responsibilities_trading\')?.parentElement;if(!label){const tmp=document.createElement(\'div\');tmp.innerHTML=field([\'responsibilities.trading\',\'Trading\',\'text\',\'People & status\'],editor.x);label=tmp.firstElementChild}if(label){const labels=[...group.children].filter(x=>x!==label);if(labels[4])group.insertBefore(label,labels[4]);else group.appendChild(label)}}}return result};\nconst v44People=wfPeople;wfPeople=function(x){const html=v44People(x);const temp=document.createElement(\'div\');temp.innerHTML=html;const root=temp.querySelector(\'.wf-roles\');if(root){const el=document.createElement(\'div\');el.className=\'wf-role\';el.innerHTML=\'<label>Trading</label><div>\'+E(x.responsibilities?.trading||\'Not assigned\')+\'</div>\';root.insertBefore(el,root.children[3]||null)}return temp.innerHTML};\n// Old tender deep links continue to open the corresponding unified opportunity.\ndev21Tender=function(id){return (S.records||[]).find(x=>x.id===(S.unified_tender_ids?.[id]||id))};\ndev21OpenTender=function(id){const x=dev21Tender(id);if(x)openRecord(\'lead\',x.id);else toast(\'Opportunity no longer exists.\')};\ndev21EditTender=function(id){const x=id?dev21Tender(id):null;edit(\'lead\',x?.id||null)};\ndev21Split=function(){if(route.page===\'leads\'&&!route.ref){const h=$(\'page\')?.querySelector(\'h1\');if(h)h.textContent=\'Leads/Tenders\'}};\nfunction v44ISO(y,m,d){return String(y).padStart(4,\'0\')+\'-\'+String(m+1).padStart(2,\'0\')+\'-\'+String(d).padStart(2,\'0\')}\nfunction v44Date(s){return new Date(s+\'T12:00:00\')}\nfunction v44DateLabel(e){if(e.precision===\'year\')return e.start.slice(0,4)+\' · date to be confirmed\';if(e.precision===\'month\')return v44Date(e.start).toLocaleDateString(\'en-GB\',{month:\'long\',year:\'numeric\'})+\' · exact dates to be confirmed\';const fmt=s=>v44Date(s).toLocaleDateString(\'en-GB\',{day:\'numeric\',month:\'short\',year:\'numeric\'});return fmt(e.start)+(e.end!==e.start?\' to \'+fmt(e.end):\'\')}\nfunction v44Events(){const q=V44.query.toLowerCase();return (S.calendar_events||[]).filter(e=>(!V44.category||e.category===V44.category)&&(!q||[e.title,e.location,e.notes].join(\' \').toLowerCase().includes(q))).sort((a,b)=>a.start.localeCompare(b.start)||a.title.localeCompare(b.title))}\nfunction v44Card(e){return `<button class="v44-event ${e.precision!==\'day\'?\'v44-provisional\':\'\'}" style="--event-color:${V44_COLORS[e.category]||V44_COLORS.Other}" data-v44-event="${E(e.id)}"><strong>${E(e.title)}</strong><small>${E(e.location||\'Location to be confirmed\')}</small><small>${E(v44DateLabel(e))}</small></button>`}\nfunction v44Month(m,large=false){const y=V44.year,first=v44ISO(y,m,1),last=v44ISO(y,m,new Date(y,m+1,0).getDate()),events=v44Events().filter(e=>e.start<=last&&e.end>=first&&e.precision!==\'year\'),offset=(new Date(y,m,1).getDay()+6)%7;let days=\'\';for(let i=0;i<offset;i++)days+=\'<div></div>\';for(let d=1;d<=Number(last.slice(-2));d++){const date=v44ISO(y,m,d),exact=events.filter(e=>e.precision===\'day\'&&e.start<=date&&e.end>=date);days+=`<div class="v44-day ${date===today()?\'today\':\'\'}" role="button" tabindex="0" data-v44-date="${date}" aria-label="${date}, ${exact.length} scheduled events. Open day or add event"><span>${d}</span>${large?exact.map(v44Card).join(\'\'):`<span class="v44-dots">${exact.map(e=>`<i class="v44-dot" style="--event-color:${V44_COLORS[e.category]}" title="${E(e.title+\' · \'+e.location)}"></i>`).join(\'\')}</span>`}</div>`}return `<section class="v44-month ${large?\'v44-large\':\'\'}"><h2><button class="textbtn" data-v44-month="${m}">${new Date(y,m,1).toLocaleDateString(\'en-GB\',{month:\'long\'})} ${y}</button></h2><div class="v44-grid">${[\'Mon\',\'Tue\',\'Wed\',\'Thu\',\'Fri\',\'Sat\',\'Sun\'].map(x=>\'<div class="v44-weekday">\'+x+\'</div>\').join(\'\')}${days}</div>${large?\'\':events.filter(e=>e.precision===\'day\').map(v44Card).join(\'\')}${events.filter(e=>e.precision!==\'day\').map(v44Card).join(\'\')}</section>`}\nfunction v44Render(){const events=v44Events(),start=V44.year+\'-01-01\',end=V44.year+\'-12-31\',annual=events.filter(e=>e.start<=end&&e.end>=start);$(\'page\').innerHTML=`<div class="x-head"><div><h1>▦ Calender</h1><p>Conferences, gatherings and team events. Select a month to drill down, or click a date to add an event.</p></div><button class="primary" id="v44Add" data-dev21-write="1">+ Add event</button></div><div class="v44-toolbar"><button id="v44Prev" aria-label="Previous period">←</button><strong>${V44.view===\'month\'?new Date(V44.year,V44.month,1).toLocaleDateString(\'en-GB\',{month:\'long\',year:\'numeric\'}):V44.year}</strong><button id="v44Next" aria-label="Next period">→</button><input id="v44Year" type="number" min="1900" max="2200" value="${V44.year}" aria-label="Calendar year" style="width:100px"><button data-v44-view="year">Year</button><button data-v44-view="month">Month</button><button data-v44-view="agenda">Agenda</button><button id="v44Today">Today</button><input id="v44Search" placeholder="Search events or locations" value="${E(V44.query)}"><select id="v44Category"><option value="">All event types</option>${V44_CATEGORIES.map(c=>`<option ${V44.category===c?\'selected\':\'\'}>${c}</option>`).join(\'\')}</select></div><div class="v44-legend">${V44_CATEGORIES.map(c=>`<span style="--event-color:${V44_COLORS[c]}">${c}</span>`).join(\'\')}<span>Dashed border: provisional dates</span></div><p class="muted">${annual.length} events in ${V44.year}. Multi-day dates are inclusive. Month-only and year-only entries are not shown as confirmed daily bookings.</p>${V44.view===\'year\'?\'<div class="v44-year">\'+Array.from({length:12},(_,m)=>v44Month(m)).join(\'\')+\'</div>\':V44.view===\'month\'?v44Month(V44.month,true):annual.map(v44Card).join(\'\')||\'<p>No events match these filters.</p>\'}${V44.view!==\'agenda\'&&annual.some(e=>e.precision===\'year\')?\'<section class="v44-detail"><h2>Year known, dates to be confirmed</h2>\'+annual.filter(e=>e.precision===\'year\').map(v44Card).join(\'\')+\'</section>\':\'\'}<div id="v44Day"></div>`;\n$(\'v44Add\').onclick=()=>v44EditEvent(null,v44ISO(V44.year,V44.month,1));$(\'v44Prev\').onclick=()=>v44Move(-1);$(\'v44Next\').onclick=()=>v44Move(1);$(\'v44Year\').onchange=e=>{const y=Number(e.target.value);if(Number.isInteger(y)&&y>=1900&&y<=2200){V44.year=y;v44Render()}};$(\'v44Today\').onclick=()=>{const d=new Date();V44.year=d.getFullYear();V44.month=d.getMonth();V44.view=\'month\';v44Render()};$(\'v44Search\').onchange=e=>{V44.query=e.target.value;v44Render()};$(\'v44Category\').onchange=e=>{V44.category=e.target.value;v44Render()};document.querySelectorAll(\'[data-v44-view]\').forEach(b=>b.onclick=()=>{V44.view=b.dataset.v44View;v44Render()});document.querySelectorAll(\'[data-v44-month]\').forEach(b=>b.onclick=()=>{V44.month=Number(b.dataset.v44Month);V44.view=\'month\';v44Render()});v44Bind($(\'page\'));oriModeControls()}\nfunction v44Move(n){if(V44.view===\'month\'){const d=new Date(V44.year,V44.month+n,1);V44.year=d.getFullYear();V44.month=d.getMonth()}else V44.year+=n;V44.year=Math.min(2200,Math.max(1900,V44.year));v44Render()}\nfunction v44Bind(root){root.querySelectorAll(\'[data-v44-event]\').forEach(b=>b.onclick=e=>{e.stopPropagation();v44ShowEvent(b.dataset.v44Event)});root.querySelectorAll(\'[data-v44-date]\').forEach(b=>{const open=()=>v44Day(b.dataset.v44Date);b.onclick=open;b.onkeydown=e=>{if(e.key===\'Enter\'||e.key===\' \'){e.preventDefault();open()}}})}\nfunction v44Day(date){V44.selected=date;const events=v44Events().filter(e=>e.precision===\'day\'&&e.start<=date&&e.end>=date);const root=$(\'v44Day\');root.innerHTML=`<section class="v44-detail"><h2>${E(v44Date(date).toLocaleDateString(\'en-GB\',{weekday:\'long\',day:\'numeric\',month:\'long\',year:\'numeric\'}))}</h2>${events.map(v44Card).join(\'\')||\'<p>No scheduled events on this date.</p>\'}<button id="v44DayAdd" class="primary" data-dev21-write="1">+ Add event on this date</button></section>`;$(\'v44DayAdd\').onclick=()=>v44EditEvent(null,date);v44Bind(root);oriModeControls();root.scrollIntoView({behavior:\'smooth\',block:\'nearest\'});if(!events.length&&oriModeCanWrite())v44EditEvent(null,date)}\nfunction v44ShowEvent(id){const e=(S.calendar_events||[]).find(x=>x.id===id);if(!e)return;const host=dev21Dialog(e.title,`<p><strong>${E(e.category)}</strong></p><p>${E(e.location||\'Location to be confirmed\')}</p><p>${E(v44DateLabel(e))}</p><p style="white-space:pre-wrap">${E(e.notes||\'\')}</p><button id="v44EditEvent" data-dev21-write="1">Edit event</button>`);host.querySelector(\'#v44EditEvent\').onclick=()=>{host.remove();v44EditEvent(id)};oriModeControls()}\nfunction v44EditEvent(id=null,date=null){if(!oriModeCanWrite()){toast(\'Enter edit mode with Writer or Administrator access to add or change events.\');return}const old=(S.calendar_events||[]).find(x=>x.id===id);if(id&&!old){toast(\'Event no longer exists.\');return}const e=copy(old||{id:uid(),title:\'\',location:\'\',start:date||today(),end:date||today(),category:\'Conference\',precision:\'day\',notes:\'\'});const host=dev21Dialog(old?\'Edit event\':\'Add event\',`<form id="v44Form"><div class="formgrid"><label>Event name<input name="title" required maxlength="300" value="${E(e.title)}"></label><label>Location<input name="location" maxlength="500" value="${E(e.location)}"></label><label>Type<select name="category">${V44_CATEGORIES.map(c=>`<option ${c===e.category?\'selected\':\'\'}>${c}</option>`).join(\'\')}</select></label><label>Date certainty<select name="precision"><option value="day" ${e.precision===\'day\'?\'selected\':\'\'}>Exact dates</option><option value="month" ${e.precision===\'month\'?\'selected\':\'\'}>Month known, dates TBC</option><option value="year" ${e.precision===\'year\'?\'selected\':\'\'}>Year known, dates TBC</option></select></label><label>Start date<input type="date" name="start" required value="${E(e.start)}"></label><label>End date (inclusive)<input type="date" name="end" required value="${E(e.end)}"></label></div><p class="muted">For month/year-only events, the start date chooses the planning month/year. Exact daily bookings are not implied.</p><label>Notes<textarea name="notes" maxlength="10000">${E(e.notes||\'\')}</textarea></label><p id="v44Error" class="v44-error" role="alert"></p><div class="actions"><button type="submit" class="primary">Save event</button>${old?\'<button type="button" id="v44Delete" class="danger">Delete event</button>\':\'\'}</div></form>`);const form=host.querySelector(\'form\');let busy=false;const setBusy=v=>{busy=v;host.querySelectorAll(\'button\').forEach(b=>b.disabled=v)};form.elements.start.onchange=()=>{if(form.elements.end.value<form.elements.start.value)form.elements.end.value=form.elements.start.value};form.onsubmit=async ev=>{ev.preventDefault();if(busy)return;try{if(!oriModeCanWrite())throw Error(\'Writer or Administrator access is required.\');const data=new FormData(form);for(const key of [\'title\',\'location\',\'category\',\'precision\',\'start\',\'end\',\'notes\'])e[key]=String(data.get(key)||\'\').trim();if(!e.title)throw Error(\'Event name is required.\');if(e.precision===\'month\'){const d=v44Date(e.start);e.start=v44ISO(d.getFullYear(),d.getMonth(),1);e.end=v44ISO(d.getFullYear(),d.getMonth(),new Date(d.getFullYear(),d.getMonth()+1,0).getDate())}else if(e.precision===\'year\'){e.start=e.start.slice(0,4)+\'-01-01\';e.end=e.start.slice(0,4)+\'-12-31\'}if(e.end<e.start)throw Error(\'End date cannot be before start date.\');setBusy(true);const n=copy(S);n.calendar_events=n.calendar_events||[];const i=n.calendar_events.findIndex(x=>x.id===e.id);if(i<0)n.calendar_events.push(e);else n.calendar_events[i]=e;await xsave(n);host.remove();render();toast(\'Calendar event saved.\')}catch(err){host.querySelector(\'#v44Error\').textContent=err.message;setBusy(false)}};if(old)host.querySelector(\'#v44Delete\').onclick=async()=>{if(busy||!oriModeCanWrite()||!confirm(\'Delete this calendar event?\'))return;try{setBusy(true);const n=copy(S);n.calendar_events=n.calendar_events.filter(x=>x.id!==id);await xsave(n);host.remove();render();toast(\'Calendar event deleted.\')}catch(err){host.querySelector(\'#v44Error\').textContent=err.message;setBusy(false)}};oriModeControls()}\nif(!PAGES.some(x=>x[0]===\'calender\'))PAGES.splice(Math.max(0,PAGES.findIndex(x=>x[0]===\'settings\')),0,[\'calender\',\'Calender\',\'▦\']);const v44LeadPage=PAGES.find(x=>x[0]===\'leads\');if(v44LeadPage)v44LeadPage[1]=\'Leads/Tenders\';\nconst v44RenderBase=render;render=function(){v44RenderBase();if(S&&route.page===\'calender\'&&!route.ref)v44Render();if(S&&route.page===\'leads\'&&!route.ref){const h=$(\'page\')?.querySelector(\'h1\');if(h)h.textContent=\'Leads/Tenders\'}v44TradingSchema()};\nv44TradingSchema();if(S)render();\n</script>\n'
+HTML=HTML.replace("</body>",_V44_UI+"</body>")
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
