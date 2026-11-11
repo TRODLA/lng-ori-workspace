@@ -43,6 +43,7 @@ spec:
 
       secrets:
         - AZURE_CLIENT_SECRET
+        - TEAMS_FEED_INGEST_SECRET
 
       environmentConfig:
         - environment: dev
