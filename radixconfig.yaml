@@ -71,6 +71,7 @@ spec:
 
           variables:
             COPILOT_ENABLED: "false"
+            ALLOWED_HOSTS: "dashapp-lng-ori-workspace-prod.radix.equinor.com"
 
           resources:
             requests:
@@ -79,3 +80,41 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "200m"
+
+    - name: teamsfeed
+      src: "."
+      dockerfileName: Dockerfile.teamsfeed
+      public: true
+      ports:
+        - name: http
+          port: 8080
+      publicPort: http
+      variables:
+        AZURE_TENANT_ID: "3aa4a235-b6e2-48d5-9195-7fcf05b459b0"
+        AZURE_CLIENT_ID: "44d1d850-39c8-4be0-9d31-954cb9c3aceb"
+        AZURE_STORAGE_ACCOUNT_NAME: "gplngplabqizrlz"
+        AZURE_STORAGE_CONTAINER_NAME: "landingzone"
+        AZURE_STORAGE_BASE_DIRECTORY: "origination"
+      secrets:
+        - AZURE_CLIENT_SECRET
+        - TEAMS_FEED_INGEST_SECRET
+      environmentConfig:
+        - environment: dev
+          replicas: 1
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+        - environment: prod
+          replicas: 1
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
