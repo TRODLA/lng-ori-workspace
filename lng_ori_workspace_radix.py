@@ -4497,7 +4497,7 @@ def _teams49_post(handler):
 Handler.do_GET=_teams49_get
 Handler.do_POST=_teams49_post
 
-_TEAMS49_UI="""<style>
+_TEAMS49_UI=r"""<style>
 .t49-shell{margin:0 0 22px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(135deg,var(--panel),var(--soft));overflow:hidden;box-shadow:0 8px 24px rgba(7,23,36,.06)}.t49-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line)}.t49-head h2{margin:0 0 3px}.t49-count{border-radius:999px;background:var(--blue);color:#fff;padding:4px 10px;font-size:12px;font-weight:700}.t49-tools{display:flex;gap:8px;align-items:center}.t49-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:14px}.t49-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;min-width:0}.t49-card.processed{opacity:.72}.t49-top{display:flex;justify-content:space-between;gap:10px}.t49-source{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--blue)}.t49-body{font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 12px}.t49-meta{font-size:12px;color:var(--muted);margin-bottom:12px}.t49-actions{display:flex;gap:7px;flex-wrap:wrap}.t49-actions button,.t49-actions a{font-size:12px;min-height:34px;padding:5px 9px}.t49-empty{padding:24px;text-align:center;color:var(--muted)}@media(max-width:700px){.t49-head{flex-direction:column}.t49-grid{grid-template-columns:1fr}}
 </style><script>
 const T49={items:[],loading:false,showProcessed:false};
@@ -4510,7 +4510,7 @@ function t49Mount(){const page=document.querySelector('#page');if(!page||documen
 const t49RenderBase=render;render=function(...args){const result=t49RenderBase(...args);setTimeout(t49Mount,0);return result};setTimeout(t49Mount,0);
 </script>"""
 HTML=HTML.replace('</body>',_TEAMS49_UI+'</body>')
-HTML=HTML.replace('LNG ORI Workspace v47','LNG ORI Workspace v50').replace('LNG ORI Workspace v49','LNG ORI Workspace v50')
+HTML=HTML.replace('LNG ORI Workspace v47','LNG ORI Workspace v51').replace('LNG ORI Workspace v49','LNG ORI Workspace v51').replace('LNG ORI Workspace v50','LNG ORI Workspace v51')
 
 if __name__=='__main__':main()
 
