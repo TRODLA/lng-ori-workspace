@@ -4417,6 +4417,101 @@ def _teams48_post(handler):
 
 Handler.do_POST=_teams48_post
 
+# V49: Teams Market Feed inbox in Market Insights & Ideas.
+_TEAMS49_OLD_GET=Handler.do_GET
+_TEAMS49_OLD_POST=Handler.do_POST
+_TEAMS49_PREFIX='teams_feed/'
+
+def _teams49_blob_path(message_id):return _storage_path(_TEAMS49_PREFIX+_teams48_safe_id(message_id)+'.json')
+def _teams49_read_blob(blob):
+    item=json.loads(blob.download_blob(max_concurrency=1).readall().decode('utf-8'))
+    if not isinstance(item,dict):raise ValueError('Invalid Teams feed item.')
+    return item
+
+def _teams49_list():
+    prefix=_storage_path(_TEAMS49_PREFIX);rows=[];container=_storage_container()
+    for entry in container.list_blobs(name_starts_with=prefix):
+        if not entry.name.endswith('.json'):continue
+        try:
+            item=_teams49_read_blob(container.get_blob_client(entry.name));item['_blob_path']=entry.name;rows.append(item)
+        except Exception as exc:print('Skipping Teams feed item',entry.name,repr(exc),flush=True)
+    rows.sort(key=lambda x:(x.get('created_at') or x.get('received_at') or '',x.get('message_id') or ''),reverse=True)
+    return rows[:250]
+
+def _teams49_write(item):
+    raw=json.dumps({k:v for k,v in item.items() if not k.startswith('_')},ensure_ascii=False,indent=2).encode('utf-8')
+    _storage_container().get_blob_client(_teams49_blob_path(item['message_id'])).upload_blob(raw,overwrite=True,content_type='application/json')
+
+def _teams49_update(item,action,actor,workspace_id=''):
+    updated=copy.deepcopy(item);updated.update(processed=True,processing_action=action,processed_at=now(),processed_by=actor,workspace_item_id=workspace_id);_teams49_write(updated);return updated
+
+def _teams49_parse(item):
+    message=str(item.get('message') or '').strip();counterpart='';detail=message
+    if ' - ' in message:counterpart,detail=message.split(' - ',1);counterpart=counterpart.strip()[:160];detail=detail.strip()
+    return counterpart,detail,((counterpart+': '+detail) if counterpart else detail)[:180] or 'Teams market information'
+
+def _teams49_apply(body,actor):
+    action=str(body.get('action') or '')
+    if action not in ('insight','idea','ignore','restore'):raise ValueError('Invalid Teams feed action.')
+    message_id=_teams48_safe_id(body.get('message_id'));item=_teams49_read_blob(_storage_container().get_blob_client(_teams49_blob_path(message_id)))
+    if action=='restore':
+        clean=copy.deepcopy(item)
+        for key in ('processing_action','processed_at','processed_by','workspace_item_id'):clean.pop(key,None)
+        clean['processed']=False;_teams49_write(clean);return {'ok':True,'item':clean,'state':state()}
+    if item.get('processed'):return {'ok':True,'already_processed':True,'item':item,'state':state()}
+    if action=='ignore':return {'ok':True,'item':_teams49_update(item,action,actor),'state':state()}
+    counterpart,detail,title=_teams49_parse(item);ident=('teams-'+message_id)[:220];created=str(item.get('created_at') or '')[:10] or dt.date.today().isoformat();source_link=str(item.get('message_link') or '');source='Microsoft Teams'
+    for attempt in range(4):
+        with LOCK:
+            old=state();n=copy.deepcopy(old);collection='intelligence' if action=='insight' else 'ideas';existing=next((x for x in n.get(collection,[]) if x.get('teams_message_id')==message_id),None)
+            if existing:saved=old;ident=existing.get('id',ident)
+            else:
+                if action=='insight':record={'id':ident,'title':title,'observation':detail or title,'interpretation':'Captured from the LNG ORI Teams market feed; interpretation pending review.','implication':'Assess commercial relevance and link to the appropriate opportunity or counterparty.','source':source,'date':created,'contributor':str(item.get('sender') or 'Teams contributor'),'confidence':'Unverified statement','status':'New','counterpart':counterpart,'teams_message_id':message_id,'teams_message_link':source_link,'created':now(),'updated':now()}
+                else:record={'id':ident,'title':title,'type':'Idea','interesting':detail or title,'known':'Captured from the LNG ORI Teams market feed.','hypothesis':'Commercial relevance to be tested.','assumptions':'Message has not yet been independently validated.','questions':'What evidence, counterpart follow-up or portfolio analysis is needed?','status':'Investigate','owner':str(item.get('sender') or ''),'counterpart':counterpart,'teams_message_id':message_id,'teams_message_link':source_link,'created':now(),'updated':now()}
+                n.setdefault(collection,[]).insert(0,record);n.setdefault('history',[]).append({'at':now(),'actor':actor,'entity':collection,'id':ident,'title':title,'change':'Created from Teams Market Feed','before':None,'after':copy.deepcopy(record)})
+                try:saved=save(n,old)
+                except _SharedWorkspaceRace:
+                    if attempt==3:raise ValueError('The workspace is busy. Try again.')
+                    continue
+            break
+    return {'ok':True,'item':_teams49_update(item,action,actor,ident),'state':saved}
+
+def _teams49_get(handler):
+    if urlparse(handler.path).path!='/api/teams-feed':return _TEAMS49_OLD_GET(handler)
+    try:
+        if not handler.host_ok():raise PermissionError('Invalid host.')
+        _auth_require(handler,READ_ROLES);rows=_teams49_list();handler.send(200,{'items':rows,'pending_count':sum(not x.get('processed') for x in rows)})
+    except PermissionError as exc:handler.send(403,{'error':str(exc)})
+    except Exception as exc:print('Teams feed list failed:',repr(exc),flush=True);handler.send(503,{'error':'Teams Market Feed could not be loaded.'})
+
+def _teams49_post(handler):
+    if urlparse(handler.path).path!='/api/teams-feed/action':return _TEAMS49_OLD_POST(handler)
+    try:
+        if not handler.host_ok() or not handler.origin_ok(handler.headers.get('Origin')):raise PermissionError('Invalid request origin.')
+        if not _valid_request_token(handler.headers.get('X-ORI-Token')):raise PermissionError('Your page security token needs refreshing.')
+        _auth_require(handler,WRITE_ROLES);body=_v28_read_body(handler,100_000);claims=_auth_claims(handler);actor=str(claims.get('preferred_username') or claims.get('email') or claims.get('oid') or 'Authenticated user');handler.send(200,_teams49_apply(body,actor))
+    except PermissionError as exc:handler.send(403,{'error':str(exc)})
+    except ValueError as exc:handler.send(400,{'error':str(exc)})
+    except Exception as exc:print('Teams feed action failed:',repr(exc),flush=True);handler.send(503,{'error':'The Teams Market Feed action could not be completed.'})
+
+Handler.do_GET=_teams49_get
+Handler.do_POST=_teams49_post
+
+_TEAMS49_UI="""<style>
+.t49-shell{margin:0 0 22px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(135deg,var(--panel),var(--soft));overflow:hidden;box-shadow:0 8px 24px rgba(7,23,36,.06)}.t49-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:18px 20px;border-bottom:1px solid var(--line)}.t49-head h2{margin:0 0 3px}.t49-count{border-radius:999px;background:var(--blue);color:#fff;padding:4px 10px;font-size:12px;font-weight:700}.t49-tools{display:flex;gap:8px;align-items:center}.t49-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:14px}.t49-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;min-width:0}.t49-card.processed{opacity:.72}.t49-top{display:flex;justify-content:space-between;gap:10px}.t49-source{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--blue)}.t49-body{font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 12px}.t49-meta{font-size:12px;color:var(--muted);margin-bottom:12px}.t49-actions{display:flex;gap:7px;flex-wrap:wrap}.t49-actions button,.t49-actions a{font-size:12px;min-height:34px;padding:5px 9px}.t49-empty{padding:24px;text-align:center;color:var(--muted)}@media(max-width:700px){.t49-head{flex-direction:column}.t49-grid{grid-template-columns:1fr}}
+</style><script>
+const T49={items:[],loading:false,showProcessed:false};
+function t49Escape(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]))}
+function t49Date(v){if(!v)return '';try{return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(v))}catch(e){return v}}
+async function t49Load(){if(T49.loading)return;T49.loading=true;try{const r=await fetch('/api/teams-feed',{credentials:'same-origin',headers:{Accept:'application/json'}}),d=await r.json();if(!r.ok)throw Error(d.error||'Feed unavailable');T49.items=d.items||[];t49Paint()}catch(e){const root=document.querySelector('#t49Root');if(root)root.innerHTML='<div class="t49-empty">'+t49Escape(e.message)+'</div>'}finally{T49.loading=false}}
+function t49Paint(){const root=document.querySelector('#t49Root');if(!root)return;const visible=T49.items.filter(x=>T49.showProcessed||!x.processed),pending=T49.items.filter(x=>!x.processed).length;document.querySelector('#t49Count').textContent=pending+' new';document.querySelector('#t49Toggle').textContent=T49.showProcessed?'Hide processed':'Show processed';root.innerHTML=visible.length?'<div class="t49-grid">'+visible.map(x=>{const processed=!!x.processed,act=x.processing_action||'';return '<article class="t49-card '+(processed?'processed':'')+'"><div class="t49-top"><span class="t49-source">MICROSOFT TEAMS</span><span class="t49-count" style="background:'+(processed?'var(--muted)':'var(--green)')+'">'+t49Escape(processed?act.toUpperCase():'NEW')+'</span></div><div class="t49-body">'+t49Escape(x.message)+'</div><div class="t49-meta">'+t49Escape(x.sender||'Unknown sender')+' · '+t49Escape(t49Date(x.created_at))+'</div><div class="t49-actions">'+(!processed?'<button class="primary" onclick="t49Action(\''+t49Escape(x.message_id)+'\',\'insight\')">Add to Insights</button><button onclick="t49Action(\''+t49Escape(x.message_id)+'\',\'idea\')">Add as Idea</button><button onclick="t49Action(\''+t49Escape(x.message_id)+'\',\'ignore\')">Ignore</button>':'<button onclick="t49Action(\''+t49Escape(x.message_id)+'\',\'restore\')">Restore to inbox</button>')+(x.message_link?'<a class="button" target="_blank" rel="noopener" href="'+t49Escape(x.message_link)+'">Open in Teams</a>':'')+'</div></article>'}).join('')+'</div>':'<div class="t49-empty">No '+(T49.showProcessed?'Teams messages':'new Teams messages')+' to review.</div>'}
+async function t49Action(id,action){try{const d=await api('/api/teams-feed/action',{message_id:id,action});if(d.state){S=d.state;oriSaveBase=copy(S)}await t49Load();if(action==='insight'||action==='idea'){render();toast(action==='insight'?'Added to Market Insights.':'Added as an Idea.')}else toast(action==='ignore'?'Message ignored.':'Message restored to inbox.')}catch(e){toast(e.message)}}
+function t49Mount(){const page=document.querySelector('#page');if(!page||document.querySelector('#t49Shell'))return;const relevant=!route.ref&&['insights','intelligence','ideas'].includes(route.page);if(!relevant)return;const shell=document.createElement('section');shell.id='t49Shell';shell.className='t49-shell';shell.innerHTML='<div class="t49-head"><div><h2>Teams Market Feed <span id="t49Count" class="t49-count">…</span></h2><div class="muted">Review messages captured automatically from LNG ORI - Market Insights before adding them to the workspace.</div></div><div class="t49-tools"><button id="t49Toggle" class="small">Show processed</button><button class="small" onclick="t49Load()">Refresh</button></div></div><div id="t49Root"><div class="t49-empty">Loading Teams messages…</div></div>';page.prepend(shell);shell.querySelector('#t49Toggle').onclick=()=>{T49.showProcessed=!T49.showProcessed;t49Paint()};t49Load()}
+const t49RenderBase=render;render=function(...args){const result=t49RenderBase(...args);setTimeout(t49Mount,0);return result};setTimeout(t49Mount,0);
+</script>"""
+HTML=HTML.replace('</body>',_TEAMS49_UI+'</body>')
+HTML=HTML.replace('LNG ORI Workspace v47','LNG ORI Workspace v49')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
