@@ -4346,6 +4346,77 @@ def _v28_workspace(value):
 
 HTML=HTML.replace('LNG ORI Workspace v45','LNG ORI Workspace v47')
 
+
+# V48: authenticated Power Automate ingestion endpoint for the Teams Market Feed.
+# Power Automate sends one message at a time. The endpoint stores a separate,
+# idempotent JSON envelope under origination/teams_feed/<message_id>.json and
+# never edits the active workspace.json directly.
+_TEAMS48_OLD_POST=Handler.do_POST
+_TEAMS48_PATH='/api/teams-feed/ingest'
+_TEAMS48_DIRECTORY='teams_feed'
+_TEAMS48_MAX_BODY=256_000
+
+def _teams48_text(value,limit=20_000):
+    value=str(value or '').strip()
+    return value[:limit]
+
+def _teams48_safe_id(value):
+    value=_teams48_text(value,300)
+    if not value or not re.fullmatch(r'[A-Za-z0-9._:-]+',value):
+        raise ValueError('A valid message_id is required.')
+    return value
+
+def _teams48_authorized(handler):
+    expected=os.getenv('TEAMS_FEED_INGEST_SECRET','').strip()
+    supplied=handler.headers.get('X-ORI-Teams-Feed-Key','').strip()
+    return bool(expected and supplied and _request_hmac.compare_digest(expected,supplied))
+
+def _teams48_store(body):
+    message_id=_teams48_safe_id(body.get('message_id'))
+    message=_teams48_text(body.get('message'),20_000)
+    if not message:raise ValueError('Message content is required.')
+    envelope={
+        'schema_version':1,
+        'source':'Teams',
+        'message_id':message_id,
+        'chat':_teams48_text(body.get('chat'),500) or 'LNG ORI - Market Insights',
+        'chat_id':_teams48_text(body.get('chat_id'),500),
+        'sender':_teams48_text(body.get('sender'),500),
+        'sender_id':_teams48_text(body.get('sender_id'),500),
+        'created_at':_teams48_text(body.get('created_at'),100),
+        'message':message,
+        'message_link':_teams48_text(body.get('message_link'),4000),
+        'received_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+        'processed':False,
+    }
+    blob_path=_storage_path(f'{_TEAMS48_DIRECTORY}/{message_id}.json')
+    raw=json.dumps(envelope,ensure_ascii=False,indent=2).encode('utf-8')
+    client=_storage_container().get_blob_client(blob_path)
+    try:
+        client.upload_blob(raw,overwrite=False,content_type='application/json')
+        created=True
+    except Exception as exc:
+        # A duplicate webhook delivery is a successful idempotent replay.
+        if getattr(exc,'status_code',None)==409 or exc.__class__.__name__=='ResourceExistsError':
+            created=False
+        else:raise
+    return {'ok':True,'created':created,'message_id':message_id,'blob_path':blob_path}
+
+def _teams48_post(handler):
+    if urlparse(handler.path).path!=_TEAMS48_PATH:return _TEAMS48_OLD_POST(handler)
+    try:
+        if not handler.host_ok():raise PermissionError('Invalid host.')
+        if not _teams48_authorized(handler):raise PermissionError('Invalid Teams feed key.')
+        body=_v28_read_body(handler,_TEAMS48_MAX_BODY)
+        handler.send(201 if not body.get('_probe') else 200,_teams48_store(body));return
+    except PermissionError as exc:handler.send(403,{'error':str(exc)});return
+    except ValueError as exc:handler.send(400,{'error':str(exc)});return
+    except Exception as exc:
+        print('Teams feed ingestion failed:',repr(exc),flush=True)
+        handler.send(503,{'error':'The Teams message could not be stored.'});return
+
+Handler.do_POST=_teams48_post
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
