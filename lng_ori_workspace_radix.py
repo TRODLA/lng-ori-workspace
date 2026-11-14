@@ -4778,6 +4778,195 @@ _TEAMS56_UI='<style>/* V56: smaller Hub chrome, three-across inbox, explicit rec
 HTML=HTML.replace('</body>',_TEAMS56_UI+'</body>')
 HTML=HTML.replace('LNG ORI Workspace v55','LNG ORI Workspace v56')
 
+
+# V57: separate Outlook inbox and authenticated review routes. Teams untouched.
+def _outlook57_id(value):
+    value = str(value or '')
+    if not re.fullmatch(r'[a-f0-9]{64}', value):
+        raise ValueError('Invalid Outlook feed ID.')
+    return value
+
+
+def _outlook57_path(feed_id):
+    return _storage_path('outlook_feed/' + _outlook57_id(feed_id) + '.json')
+
+
+def _outlook57_public(item):
+    return {k: v for k, v in item.items() if not k.startswith('_') and k != 'original_html'}
+
+
+def _outlook57_read(feed_id):
+    download = _storage_container().get_blob_client(_outlook57_path(feed_id)).download_blob()
+    item = json.loads(download.readall().decode('utf-8'))
+    if not isinstance(item, dict) or item.get('feed_id') != feed_id or item.get('source') != 'Outlook':
+        raise ValueError('Invalid Outlook feed record.')
+    item['_etag'] = download.properties.etag
+    return item
+
+
+def _outlook57_write(item):
+    raw = json.dumps({k:v for k,v in item.items() if not k.startswith('_')},
+                     ensure_ascii=False, allow_nan=False).encode('utf-8')
+    kwargs = {'overwrite': True}
+    if item.get('_etag'):
+        kwargs.update(etag=item['_etag'], match_condition=MatchConditions.IfNotModified)
+    try:
+        _storage_container().get_blob_client(_outlook57_path(item['feed_id'])).upload_blob(raw, **kwargs)
+    except ResourceModifiedError as exc:
+        raise ValueError('This email was updated by another user. Refresh the feed and try again.') from exc
+
+
+def _outlook57_list():
+    container = _storage_container()
+    rows = []
+    for entry in container.list_blobs(name_starts_with=_storage_path('outlook_feed/')):
+        filename = entry.name.rsplit('/', 1)[-1]
+        if not re.fullmatch(r'[a-f0-9]{64}\.json', filename):
+            continue
+        try:
+            rows.append(_outlook57_public(_outlook57_read(filename[:-5])))
+        except Exception as exc:
+            print('Outlook feed record could not be read:', type(exc).__name__, flush=True)
+    rows.sort(key=lambda x:(x.get('created_at') or x.get('received_at') or '', x['feed_id']), reverse=True)
+    pending = sum(not x.get('processed') for x in rows)
+    # Pending records are not hidden behind a long processed history.
+    ordered = [x for x in rows if not x.get('processed')] + [x for x in rows if x.get('processed')]
+    return {'items': ordered[:250], 'pending_count': pending, 'has_more': len(rows) > 250}
+
+
+def _outlook57_record(item, action, actor):
+    # Reuse the tested commercial field mapper, then replace all Teams identity
+    # fields. Email identifiers never enter the Teams storage or duplicate key.
+    temporary = copy.deepcopy(item)
+    temporary['message_id'] = item['feed_id']
+    temporary['message_link'] = ''
+    temporary['chat_id'] = ''
+    record = _feed54_record(temporary, action, actor)
+    for key in list(record):
+        if key.startswith('teams_'):
+            del record[key]
+    record.update(id='outlook-' + item['feed_id'], source='Microsoft Outlook',
+        outlook_feed_id=item['feed_id'], outlook_message_id=item['message_id'],
+        outlook_internet_message_id=item.get('internet_message_id', ''),
+        outlook_mailbox=item.get('mailbox', ''), outlook_subject=item.get('subject', ''),
+        outlook_sender=item.get('sender', ''), outlook_sender_email=item.get('sender_email', ''),
+        outlook_received_at=item.get('created_at', ''),
+        outlook_original_message=item.get('original_message', item.get('message', '')),
+        outlook_message_link=item.get('message_link', ''))
+    ai = _feed54_ai(item)
+    if not ai:
+        record['counterpart'] = ''
+    record['title'] = ((ai or {}).get('summary') or item.get('subject') or 'Outlook market information')[:300]
+    record['market45']['source'] = 'Outlook'
+    record['market45']['capture_mode'] = 'ai_builder_reviewed' if ai else 'manual'
+    if item.get('message_link'):
+        record['reference_links'] = [{'url':item['message_link'], 'title':'Source email in Outlook'}]
+    return record
+
+
+def _outlook57_apply(body, actor):
+    action = str(body.get('action') or '')
+    if action not in ('insight','idea','ignore','restore','edit'):
+        raise ValueError('Invalid Outlook feed action.')
+    feed_id = _outlook57_id(body.get('feed_id'))
+    item = _outlook57_read(feed_id)
+    if action == 'edit':
+        if item.get('processed'):
+            raise ValueError('Restore the email before editing.')
+        raw = _feed_ai_unwrap(body.get('ai_extraction'))
+        if raw is None:
+            raise ValueError('No proposed fields supplied.')
+        item.setdefault('ai_original_extraction', copy.deepcopy(item.get('ai_extraction')))
+        item.update(ai_extraction=_feed_ai_validate(raw), ai_status='reviewed',
+                    ai_reviewed_at=now(), ai_reviewed_by=actor, edited_at=now(), edited_by=actor)
+        _outlook57_write(item)
+        return {'ok':True, 'item':_outlook57_public(item)}
+    if action == 'restore':
+        for key in ('processing_action','processed_at','processed_by','workspace_item_id'):
+            item.pop(key, None)
+        item['processed'] = False
+        _outlook57_write(item)
+        return {'ok':True, 'item':_outlook57_public(item)}
+    if item.get('processed'):
+        return {'ok':True, 'already_processed':True, 'item':_outlook57_public(item)}
+    if action == 'ignore':
+        item.update(processed=True, processing_action='ignore', processed_at=now(), processed_by=actor)
+        _outlook57_write(item)
+        return {'ok':True, 'item':_outlook57_public(item)}
+    record = _outlook57_record(item, action, actor)
+    collection = 'intelligence' if action == 'insight' else 'ideas'
+    for attempt in range(4):
+        with LOCK:
+            old = state()
+            existing = next((x for col in ('intelligence','ideas') for x in old.get(col, [])
+                             if x.get('outlook_feed_id') == feed_id), None)
+            if existing:
+                ident = existing['id']
+                break
+            n = copy.deepcopy(old)
+            n.setdefault(collection, []).insert(0, record)
+            n.setdefault('history', []).append({'at':now(), 'actor':actor, 'entity':collection,
+                'id':record['id'], 'title':record['title'], 'change':'Approved from Outlook Market Feed',
+                'before':None, 'after':copy.deepcopy(record)})
+            try:
+                save(n, old)
+                ident = record['id']
+                break
+            except _SharedWorkspaceRace:
+                if attempt == 3:
+                    raise ValueError('The workspace is busy. Try again.')
+    item.update(processed=True, processing_action=action, processed_at=now(),
+                processed_by=actor, workspace_item_id=ident)
+    _outlook57_write(item)
+    return {'ok':True, 'item':_outlook57_public(item), 'workspace_item_id':ident, 'reload_workspace':True}
+
+
+_OUTLOOK57_OLD_GET = Handler.do_GET
+_OUTLOOK57_OLD_POST = Handler.do_POST
+
+def _outlook57_get(handler):
+    if urlparse(handler.path).path != '/api/outlook-feed':
+        return _OUTLOOK57_OLD_GET(handler)
+    try:
+        if not handler.host_ok():
+            raise PermissionError('Invalid host.')
+        _auth_require(handler, READ_ROLES)
+        handler.send(200, _outlook57_list())
+    except PermissionError as exc:
+        handler.send(403, {'error':str(exc)})
+    except Exception as exc:
+        print('Outlook feed list failed:', type(exc).__name__, flush=True)
+        handler.send(503, {'error':'Outlook Market Feed could not be loaded.'})
+
+
+def _outlook57_post(handler):
+    if urlparse(handler.path).path != '/api/outlook-feed/action':
+        return _OUTLOOK57_OLD_POST(handler)
+    try:
+        if not handler.host_ok() or not handler.origin_ok(handler.headers.get('Origin')):
+            raise PermissionError('Invalid request origin.')
+        if not _valid_request_token(handler.headers.get('X-ORI-Token')):
+            raise PermissionError('Your page security token needs refreshing.')
+        _auth_require(handler, WRITE_ROLES)
+        body = _v28_read_body(handler, 100000)
+        claims = _auth_claims(handler)
+        actor = str(claims.get('preferred_username') or claims.get('email') or claims.get('oid') or 'Authenticated user')
+        handler.send(200, _outlook57_apply(body, actor))
+    except PermissionError as exc:
+        handler.send(403, {'error':str(exc)})
+    except ValueError as exc:
+        handler.send(400, {'error':str(exc)})
+    except Exception as exc:
+        print('Outlook feed action failed:', type(exc).__name__, flush=True)
+        handler.send(503, {'error':'The Outlook feed action could not be completed.'})
+
+Handler.do_GET = _outlook57_get
+Handler.do_POST = _outlook57_post
+
+_OUTLOOK57_UI='<style>.t53-source[role=button]{cursor:pointer;transition:border-color .15s,box-shadow .15s}.t53-source[role=button]:focus-visible{outline:3px solid #68b8ff;outline-offset:3px}.t53-source.outlook.active{border-color:#46b5ff;background:linear-gradient(135deg,rgba(14,102,176,.3),rgba(17,48,68,.78))}.t53-source:not(.active){box-shadow:none}.t53-source.outlook .t53-badge{background:#ed294f}.t55-details-body>strong{display:block;color:#eaf7ff;margin-bottom:8px}.t54-source{max-height:220px;overflow:auto}\n</style><script>// V57: source-aware Hub. The Teams API and approval flow remain unchanged.\nconst O57={items:[],loading:false,loaded:false,error:\'\',pending:0,hasMore:false,showProcessed:false,busy:false};\nconst F57={source:\'Teams\',expanded:new Set()};\nfunction f57Source(){return F57.source===\'Outlook\'?O57:T49}\nfunction f57Switch(source){F57.source=source;f57Setup();t49Paint();if(source===\'Outlook\'&&!O57.loaded)o57Load()}\nasync function o57Load(){if(O57.loading)return;O57.loading=true;try{const r=await fetch(\'/api/outlook-feed\',{credentials:\'same-origin\',headers:{Accept:\'application/json\'}});const d=await r.json();if(!r.ok)throw Error(d.error||\'Outlook feed unavailable\');O57.items=d.items||[];O57.pending=d.pending_count??O57.items.filter(x=>!x.processed).length;O57.hasMore=!!d.has_more;O57.loaded=true;O57.error=\'\'}catch(e){O57.error=e.message}finally{O57.loading=false;f57Setup();t49Paint()}}\nfunction f57Refresh(){t49Load();o57Load()}\nfunction f57Setup(){const hub=document.querySelector(\'#t49Shell\');if(!hub)return;const sources=hub.querySelectorAll(\'.t53-source\');sources.forEach((card,i)=>{const source=i===0?\'Teams\':\'Outlook\';card.classList.toggle(\'active\',F57.source===source);card.setAttribute(\'role\',\'button\');card.tabIndex=0;card.setAttribute(\'aria-pressed\',String(F57.source===source));card.onclick=()=>f57Switch(source);card.onkeydown=e=>{if(e.key===\'Enter\'||e.key===\' \'){e.preventDefault();f57Switch(source)}}});const outlook=sources[1];if(outlook){const icon=outlook.querySelector(\'.t53-icon\');if(icon&&!icon.querySelector(\'#o57Count\')){const badge=document.createElement(\'span\');badge.id=\'o57Count\';badge.className=\'t53-badge\';icon.append(badge)}const badge=outlook.querySelector(\'#o57Count\');if(badge){badge.textContent=O57.loaded?O57.pending:\'…\';badge.setAttribute(\'aria-label\',O57.pending+\' new Outlook emails\')}const status=outlook.querySelector(\'.t53-status\');if(status){status.textContent=O57.error?\'Unavailable\':O57.loaded?\'Ready\':\'Checking\';status.classList.toggle(\'pending\',!!O57.error||!O57.loaded)}const meta=outlook.querySelector(\'.t53-source-meta\');if(meta)meta.textContent=O57.error?\'Could not load Outlook feed\':O57.loaded?(O57.pending?O57.pending+\' email\'+(O57.pending===1?\'\':\'s\')+\' ready for review\':\'Up to date · no new emails\'):\'Checking Outlook inbox…\'}const heading=hub.querySelector(\'.t53-feedhead h2\');if(heading)heading.textContent=F57.source===\'Outlook\'?\'Outlook intelligence inbox\':\'Teams intelligence inbox\';const subtitle=hub.querySelector(\'.t53-feedhead span\');if(subtitle)subtitle.textContent=F57.source===\'Outlook\'?\'Shared-mailbox submissions. AI fields remain proposals until approved.\':\'AI-processed updates, ready to approve. Open Details only when needed.\';const tools=hub.querySelector(\'.t53-tools\');if(tools){const buttons=tools.querySelectorAll(\'button\');if(buttons[0]){buttons[0].textContent=f57Source().showProcessed?\'Hide processed\':\'Show processed\';buttons[0].onclick=()=>{const state=f57Source();state.showProcessed=!state.showProcessed;t49Paint()}}if(buttons[1])buttons[1].onclick=f57Refresh}}\nfunction f57Action(item,action){return F57.source===\'Outlook\'?o57Action(item.feed_id,action):t49Action(item.message_id,action)}\nasync function o57Action(id,action){if(O57.busy)return;O57.busy=true;try{const d=await api(\'/api/outlook-feed/action\',{feed_id:id,action});if(d.reload_workspace){location.reload();return}await o57Load();toast(action===\'ignore\'?\'Email ignored.\':\'Email restored to inbox.\')}catch(e){toast(e.message)}finally{O57.busy=false}}\nfunction t49Paint(){const root=document.querySelector(\'#t49Root\');if(!root)return;const teamsPending=T49.items.filter(x=>!x.processed).length;const badge=document.querySelector(\'#t49Count\');if(badge){badge.textContent=teamsPending;badge.setAttribute(\'aria-label\',teamsPending+\' new Teams messages\')}const meta=document.querySelector(\'#t53Summary\');if(meta)meta.textContent=teamsPending?teamsPending+\' message\'+(teamsPending===1?\'\':\'s\')+\' ready for review\':\'Up to date · no new messages\';f57Setup();root.replaceChildren();const state=f57Source(),isEmail=F57.source===\'Outlook\';if(isEmail&&O57.error){const error=document.createElement(\'div\');error.className=\'t53-empty\';error.textContent=O57.error;root.append(error);return}const rows=state.items.filter(x=>state.showProcessed||!x.processed);if(!rows.length){const empty=document.createElement(\'div\');empty.className=\'t53-empty\';empty.textContent=isEmail&&O57.loading?\'Loading Outlook submissions…\':state.showProcessed?\'No \'+F57.source+\' items to display.\':\'You are all caught up. New \'+F57.source+\' submissions will appear here.\';root.append(empty);return}const list=document.createElement(\'div\');list.className=\'t55-list\';root.append(list);for(const item of rows){const ai=t54Unwrap(item.ai_extraction),ready=!!ai&&![\'failed\',\'invalid\'].includes(item.ai_status);const card=document.createElement(\'article\');card.className=\'t55-notification\'+(item.processed?\' processed\':\'\');const status=document.createElement(\'span\');status.className=\'t55-check\'+(ready?\'\':\' warning\');status.textContent=ready?\'✓\':\'!\';status.title=ready?\'AI extraction available; source information is not independently verified.\':\'No usable AI extraction. Review before approval.\';status.setAttribute(\'aria-label\',ready?\'AI processed\':\'Needs review\');const content=document.createElement(\'div\');content.className=\'t55-content\';const title=document.createElement(\'div\');title.className=\'t55-title\';title.textContent=isEmail?t55Title({...item,message:ai?.summary||item.subject||item.message,original_message:ai?.summary||item.subject||item.original_message},ai):t55Title(item,ai);const info=document.createElement(\'div\');info.className=\'t55-meta\';info.textContent=[ready?\'AI processed\':\'Needs review\',F57.source,ai?.category,item.sender||item.sender_email,t49Date(item.created_at),item.processed?item.processing_action:null].filter(Boolean).join(\' · \');content.append(title,info);const actions=document.createElement(\'div\');actions.className=\'t55-actions\';if(!item.processed){actions.append(t55Button(\'Approve\',()=>isEmail?o57Action(item.feed_id,\'insight\'):t49Action(item.message_id,\'insight\'),\'t55-approve\'),t55Button(\'Change\',()=>isEmail?o57Change(item.feed_id):t49Change(item.message_id)),t55Button(\'Ignore\',()=>isEmail?o57Action(item.feed_id,\'ignore\'):t49Action(item.message_id,\'ignore\')))}else actions.append(t55Button(\'Restore\',()=>isEmail?o57Action(item.feed_id,\'restore\'):t49Action(item.message_id,\'restore\')));const details=document.createElement(\'details\');details.className=\'t55-details\';const key=F57.source+\':\'+(item.feed_id||item.message_id);details.open=F57.expanded.has(key);details.ontoggle=()=>{if(details.open)F57.expanded.add(key);else F57.expanded.delete(key)};const summary=document.createElement(\'summary\');summary.textContent=\'Details\';details.append(summary);const body=document.createElement(\'div\');body.className=\'t55-details-body\';if(isEmail){const subject=document.createElement(\'strong\');subject.textContent=item.subject||\'(No subject)\';body.append(subject);const provenance=document.createElement(\'p\');provenance.className=\'t55-meta\';provenance.textContent=\'Submitted from: \'+(item.sender_email||item.sender||\'Not recorded\')+\' · Shared mailbox: \'+(item.mailbox||\'\');body.append(provenance)}const original=document.createElement(\'div\');original.className=\'t55-original\';original.textContent=item.original_message??item.message??\'\';body.append(original);const fields=document.createElement(\'div\');fields.innerHTML=t54Details(item);body.append(fields);const extra=document.createElement(\'div\');extra.className=\'t55-actions\';if(!item.processed)extra.append(t55Button(\'Add as idea\',()=>isEmail?o57Action(item.feed_id,\'idea\'):t49Action(item.message_id,\'idea\')));try{const u=new URL(item.message_link);const allowed=isEmail?[\'outlook.office.com\',\'outlook.office365.com\',\'outlook.cloud.microsoft\']:[\'teams.microsoft.com\',\'teams.cloud.microsoft\'];if(u.protocol===\'https:\'&&allowed.includes(u.hostname)&&!u.username&&!u.password){const a=document.createElement(\'a\');a.className=\'button\';a.textContent=isEmail?\'Open in Outlook ↗\':\'Open in Teams ↗\';a.href=u.href;a.target=\'_blank\';a.rel=\'noopener noreferrer\';extra.append(a)}}catch(e){}body.append(extra);details.append(body);if(typeof oriModeCanWrite===\'function\'&&!oriModeCanWrite())for(const b of [...actions.querySelectorAll(\'button\'),...extra.querySelectorAll(\'button\')])b.disabled=true;card.append(status,content,actions,details);list.append(card)}if(isEmail&&O57.hasMore){const note=document.createElement(\'p\');note.className=\'t55-meta\';note.textContent=\'Showing the first 250 records, pending emails first. The unread badge includes all pending emails.\';root.append(note)}}\nfunction o57Change(id){const item=O57.items.find(x=>x.feed_id===id);if(!item)return;document.querySelector(\'#o57Dialog\')?.remove();const ai=t54Unwrap(item.ai_extraction)||{},dialog=document.createElement(\'dialog\');dialog.id=\'o57Dialog\';dialog.className=\'t54-dialog\';const form=document.createElement(\'form\');form.innerHTML=\'<h2>Review proposed email fields</h2><p>Original email content is preserved unchanged. Attachments have not been read.</p><div class="t54-source"></div><div class="t54-editgrid"></div><div class="t54-error" role="alert"></div><footer><button type="button" data-cancel>Cancel</button><button type="submit" class="primary">Save proposed fields</button></footer>\';form.querySelector(\'.t54-source\').textContent=(item.subject||\'\')+\'\\n\\n\'+(item.original_message??item.message??\'\');const enums={category:[\'Pricing & Commercial\',\'Demand & Supply\',\'Policy & Regulation\',\'Market Reports\',\'Other\'],information_type:[\'Offer\',\'Bid\',\'Market indication\',\'Demand\',\'Supply\',\'Transaction\',\'Market observation\',\'Report\',\'Policy / Regulation\',\'Other\'],pricing_index:[\'HH\',\'JKM\',\'TTF\',\'Brent\',\'NBP\',\'THE\',\'Hybrid\',\'Other\'],contract_type:[\'SPA (DES)\',\'SPA (FOB)\',\'HOA\',\'MSPA\',\'Spot\',\'Other\'],confidence:[\'High\',\'Medium\',\'Low\']};const fields={...T54_LABELS,counterparty_raw:\'Counterparty as originally written\',summary:\'Summary\'},grid=form.querySelector(\'.t54-editgrid\');for(const[key,label]of Object.entries(fields)){const wrap=document.createElement(\'label\');wrap.textContent=label;let input;if(enums[key]){input=document.createElement(\'select\');for(const value of [\'\',...enums[key]]){const o=document.createElement(\'option\');o.value=value;o.textContent=value||\'Not identified\';input.append(o)}}else{input=document.createElement(key===\'summary\'?\'textarea\':\'input\');if(key===\'summary\'){input.rows=3;wrap.className=\'wide\'}else if([\'volume_mtpa\',\'start_year\',\'duration_years\'].includes(key)){input.type=\'number\';input.step=key===\'volume_mtpa\'?\'any\':\'1\';input.min=\'0\'}}input.name=key;input.value=ai[key]??\'\';wrap.append(input);grid.append(wrap)}form.querySelector(\'[data-cancel]\').onclick=()=>dialog.close();form.onsubmit=async e=>{e.preventDefault();const values={};for(const key of Object.keys(fields)){const value=form.elements.namedItem(key).value.trim();values[key]=value===\'\'?null:[\'volume_mtpa\',\'start_year\',\'duration_years\'].includes(key)?Number(value):value}const button=form.querySelector(\'[type=submit]\');button.disabled=true;try{await api(\'/api/outlook-feed/action\',{feed_id:id,action:\'edit\',ai_extraction:values});dialog.close();await o57Load();toast(\'Proposed email fields saved.\')}catch(err){form.querySelector(\'.t54-error\').textContent=err.message}finally{button.disabled=false}};dialog.append(form);dialog.addEventListener(\'close\',()=>dialog.remove());document.body.append(dialog);dialog.showModal()}\nconst f57AfterBase=t55AfterMarketRender;\nt55AfterMarketRender=function(...args){const result=f57AfterBase.apply(this,args);f57Setup();if(document.querySelector(\'#t49Shell\')){t49Paint();if(!O57.loaded&&!O57.loading&&!O57.error)o57Load()}return result};\nsetTimeout(()=>{f57Setup();if(document.querySelector(\'#t49Shell\')){o57Load();t49Paint()}},0);\n</script>'
+HTML=HTML.replace('</body>',_OUTLOOK57_UI+'</body>')
+HTML=HTML.replace('LNG ORI Workspace v56','LNG ORI Workspace v57')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
