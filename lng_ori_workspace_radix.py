@@ -4257,7 +4257,7 @@ def validate(n):
             if m.get('category') not in _MARKET45_CATEGORIES:raise ValueError('Select a valid market category.')
             if m.get('kind') not in ('Insight','Idea','Interaction'):raise ValueError('Invalid market record kind.')
             if m.get('source') not in ('Manual','Teams','Outlook','File','Other'):raise ValueError('Invalid market source.')
-            if m.get('capture_mode') not in ('manual','demo','file'):raise ValueError('Live ingestion is not configured. Use manual capture.')
+            if m.get('capture_mode') not in ('manual','demo','file','ai_builder_reviewed','teams_manual_review'):raise ValueError('Live ingestion is not configured. Use manual capture.')
             if m.get('confidence') not in ('High','Medium','Low','Not assessed'):raise ValueError('Invalid market confidence.')
             for key,limit in [('contract_type',200),('custom_formula',1000)]:
                 if not isinstance(m.get(key,''),str) or len(m.get(key,''))>limit:raise ValueError('Invalid market '+key)
@@ -4440,7 +4440,7 @@ def _teams49_list():
 
 def _teams49_write(item):
     raw=json.dumps({k:v for k,v in item.items() if not k.startswith('_')},ensure_ascii=False,indent=2).encode('utf-8')
-    _storage_container().get_blob_client(_teams49_blob_path(item['message_id'])).upload_blob(raw,overwrite=True,content_type='application/json')
+    _storage_container().get_blob_client(_teams49_blob_path(item['message_id'])).upload_blob(raw,overwrite=True)
 
 def _teams49_update(item,action,actor,workspace_id=''):
     updated=copy.deepcopy(item);updated.update(processed=True,processing_action=action,processed_at=now(),processed_by=actor,workspace_item_id=workspace_id);_teams49_write(updated);return updated
@@ -4539,6 +4539,234 @@ function t49Mount(){const page=document.querySelector('#page');if(!page||documen
 </script>"""
 HTML=HTML.replace('</body>',_TEAMS53_UI+'</body>')
 HTML=HTML.replace('LNG ORI Workspace v51','LNG ORI Workspace v53')
+
+def _feed_ai_unwrap(value):
+    """Accept direct JSON, serialized predictionOutput, or legacy text wrappers."""
+    for _ in range(8):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.startswith('```'):
+                text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I)
+            value = json.loads(text)
+            continue
+        if not isinstance(value, dict):
+            raise ValueError('AI extraction must be a JSON object.')
+        for key in ('structuredOutput', 'predictionOutput'):
+            if value.get(key) is not None:
+                value = value[key]
+                break
+        else:
+            if 'category' in value or 'pricing_formula' in value or 'counterparty' in value:
+                return value
+            if value.get('text'):
+                value = value['text']
+                continue
+            raise ValueError('No structured LNG fields found in AI output.')
+    raise ValueError('AI output contains too many nested wrappers.')
+
+
+def _feed_ai_validate(raw):
+    import math
+    if not isinstance(raw, dict):
+        raise ValueError('Expected structured LNG fields.')
+    def text(key, limit=500):
+        value = raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            raise ValueError('Invalid text field: ' + key)
+        value = str(value).strip()
+        return None if value.lower() in ('', 'null', 'none', 'not identified', 'not set') else value[:limit]
+    def enum(key, allowed, default=None):
+        value = text(key)
+        if value is None:
+            return default
+        for candidate in allowed:
+            if candidate.lower() == value.lower():
+                return candidate
+        raise ValueError('Unsupported ' + key + ': ' + value)
+    def number(key, integer=False):
+        value = raw.get(key)
+        if value is None or (isinstance(value, str) and value.strip().lower() in ('', 'null', 'none')):
+            return None
+        if isinstance(value, bool):
+            raise ValueError('Invalid numeric field: ' + key)
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError('Invalid numeric field: ' + key)
+        if integer and not value.is_integer():
+            raise ValueError('Expected a whole number: ' + key)
+        return int(value) if integer else value
+    result = {
+        'category': enum('category', ['Pricing & Commercial','Demand & Supply','Policy & Regulation','Market Reports','Other'], 'Other'),
+        'information_type': enum('information_type', ['Offer','Bid','Market indication','Demand','Supply','Transaction','Market observation','Report','Policy / Regulation','Other'], 'Other'),
+        'counterparty_raw': text('counterparty_raw', 300),
+        'counterparty': text('counterparty', 300),
+        'region': text('region', 300),
+        'pricing_index': enum('pricing_index', ['HH','JKM','TTF','Brent','NBP','THE','Hybrid','Other']),
+        'pricing_formula': text('pricing_formula', 1000),
+        'contract_type': enum('contract_type', ['SPA (DES)','SPA (FOB)','HOA','MSPA','Spot','Other']),
+        'volume_mtpa': number('volume_mtpa'),
+        'start_year': number('start_year', True),
+        'duration_years': number('duration_years', True),
+        'confidence': enum('confidence', ['High','Medium','Low'], 'Low'),
+        'summary': text('summary', 3000),
+    }
+    if result['start_year'] is not None and not 1900 <= result['start_year'] <= 2200:
+        raise ValueError('Start year is outside the supported range.')
+    if result['duration_years'] is not None and not 1 <= result['duration_years'] <= 100:
+        raise ValueError('Duration must be between 1 and 100 years.')
+    return result
+
+
+def _feed_source_link(value, chat_id, message_id):
+    from urllib.parse import urlparse, quote
+    value = str(value or '').strip()
+    parsed = urlparse(value)
+    if parsed.scheme == 'https' and parsed.hostname in ('teams.microsoft.com', 'teams.cloud.microsoft'):
+        return value
+    if chat_id and message_id:
+        return 'https://teams.microsoft.com/l/message/' + quote(str(chat_id), safe='') + '/' + quote(str(message_id), safe='') + '?context=%7B%22contextType%22%3A%22chat%22%7D'
+    return ''
+
+
+# V54: AI Builder extraction review and schema-aware approval. Existing UI,
+# market tables, pricing analytics, archives and shared-workspace save remain.
+def _feed54_ai(item):
+    raw = _feed_ai_unwrap(item.get('ai_extraction'))
+    return _feed_ai_validate(raw) if raw is not None else None
+
+
+def _feed54_record(item, action, actor):
+    ai = _feed54_ai(item)
+    counterpart, detail, title = _teams49_parse(item)
+    if ai:
+        counterpart = ai.get('counterparty') or ''
+        title = ai.get('summary') or title
+    stamp = now()
+    original = item.get('original_message', item.get('message', ''))
+    link = _feed_source_link(item.get('message_link'), item.get('chat_id'), item['message_id'])
+    record = {
+        'id': 'teams-' + item['message_id'], 'title': title[:300],
+        'date': str(item.get('created_at') or '')[:10] or dt.date.today().isoformat(),
+        'counterpart': counterpart, 'region': (ai or {}).get('region') or '',
+        'index': (ai or {}).get('pricing_index') or '', 'source': 'Microsoft Teams',
+        'teams_message_id': item['message_id'], 'teams_chat_id': item.get('chat_id', ''),
+        'teams_message_link': link, 'teams_original_message': original,
+        'teams_sender': item.get('sender', ''), 'teams_created_at': item.get('created_at', ''),
+        'created': stamp, 'updated': stamp,
+    }
+    if action == 'insight':
+        record.update(observation=original, interpretation=(ai or {}).get('summary') or '',
+                      implication='Review commercial relevance; AI extraction is not source verification.',
+                      contributor=item.get('sender') or 'Teams contributor', status='New')
+    else:
+        record.update(type='Idea', interesting=original, known=(ai or {}).get('summary') or '',
+                      hypothesis='', assumptions='Source information requires independent validation.',
+                      questions='', owner=item.get('sender') or '', status='Investigate')
+    market = {
+        'kind': 'Insight' if action == 'insight' else 'Idea', 'source': 'Teams',
+        'capture_mode': 'ai_builder_reviewed' if ai else 'teams_manual_review',
+        'category': (ai or {}).get('category') or 'Other',
+        # Model confidence is stored separately from human source confidence.
+        'confidence': 'Not assessed', 'ai_confidence': (ai or {}).get('confidence'),
+        'contract_type': (ai or {}).get('contract_type') or '',
+        'volume_mtpa': (ai or {}).get('volume_mtpa'),
+        'start_year': (ai or {}).get('start_year'),
+        'duration_years': (ai or {}).get('duration_years'),
+        'custom_formula': (ai or {}).get('pricing_formula') or '',
+        'information_type': (ai or {}).get('information_type') or '',
+        'reviewed_by': actor, 'reviewed_at': stamp,
+    }
+    # Only explicit single-index percentage formulas become chartable pricing.
+    # Complex/hybrid formulas remain intact as custom_formula, never guessed.
+    formula = market['custom_formula']
+    match = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*%\s*(HH|TTF|JKM|Brent|THE)\s*(?:([+-])\s*\$?\s*(\d+(?:\.\d+)?))?\s*', formula, re.I)
+    if match and ai and match.group(2).lower() == (ai.get('pricing_index') or '').lower():
+        index = next(x for x in ['HH','TTF','JKM','Brent','THE'] if x.lower() == match.group(2).lower())
+        additive = float(match.group(4) or 0) * (-1 if match.group(3) == '-' else 1)
+        market['pricing'] = {'index': index, 'slope_pct': float(match.group(1)),
+                             'additive': additive, 'output_unit': 'USD/MMBtu', 'reviewed': True,
+                             'reviewed_by': actor, 'reviewed_at': stamp}
+    record['market45'] = market
+    if ai:
+        record['ai_extraction'] = copy.deepcopy(ai)
+        record['ai_original_extraction'] = copy.deepcopy(item.get('ai_original_extraction') or ai)
+    return record
+
+
+def _teams49_apply(body, actor):
+    action = str(body.get('action') or '')
+    if action not in ('insight','idea','ignore','restore','edit'):
+        raise ValueError('Invalid Teams feed action.')
+    message_id = _teams48_safe_id(body.get('message_id'))
+    item = _teams49_read_blob(_storage_container().get_blob_client(_teams49_blob_path(message_id)))
+    if action == 'edit':
+        if item.get('processed'):
+            raise ValueError('Restore the message before editing.')
+        if 'ai_extraction' in body:
+            raw = _feed_ai_unwrap(body['ai_extraction'])
+            if raw is None:
+                raise ValueError('No proposed fields supplied.')
+            ai = _feed_ai_validate(raw)
+            item.setdefault('ai_original_extraction', copy.deepcopy(item.get('ai_extraction')))
+            item['ai_extraction'] = ai
+            item['ai_status'] = 'reviewed'
+            item['ai_reviewed_at'] = now()
+            item['ai_reviewed_by'] = actor
+        elif 'message' in body:
+            # Preserve the source. Manual notes are distinct from source text.
+            item['review_note'] = str(body.get('message') or '')[:20000]
+        else:
+            raise ValueError('No changes supplied.')
+        item['edited_at'] = now()
+        item['edited_by'] = actor
+        _teams49_write(item)
+        return {'ok': True, 'item': item}
+    if action == 'restore':
+        for key in ('processing_action','processed_at','processed_by','workspace_item_id'):
+            item.pop(key, None)
+        item['processed'] = False
+        _teams49_write(item)
+        return {'ok': True, 'item': item}
+    if item.get('processed'):
+        return {'ok': True, 'already_processed': True, 'item': item}
+    if action == 'ignore':
+        return {'ok': True, 'item': _teams49_update(item, action, actor)}
+    record = _feed54_record(item, action, actor)
+    collection = 'intelligence' if action == 'insight' else 'ideas'
+    for attempt in range(4):
+        with LOCK:
+            old = state()
+            existing = next((x for col in ('intelligence','ideas') for x in old.get(col, [])
+                             if x.get('teams_message_id') == message_id), None)
+            if existing:
+                ident = existing['id']
+                break
+            n = copy.deepcopy(old)
+            n.setdefault(collection, []).insert(0, record)
+            n.setdefault('history', []).append({'at': now(), 'actor': actor, 'entity': collection,
+                'id': record['id'], 'title': record['title'], 'change': 'Approved from Teams Market Feed',
+                'before': None, 'after': copy.deepcopy(record)})
+            try:
+                save(n, old)
+                ident = record['id']
+                break
+            except _SharedWorkspaceRace:
+                if attempt == 3:
+                    raise ValueError('The workspace is busy. Try again.')
+    # Replays after a partial failure repair the envelope without duplicating
+    # or changing an already-approved workspace record.
+    return {'ok': True, 'item': _teams49_update(item, action, actor, ident),
+            'workspace_item_id': ident, 'reload_workspace': True}
+
+_TEAMS54_UI='<style>\n.t54-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0;padding:14px;border:1px solid rgba(120,185,220,.24);border-radius:12px;background:rgba(0,0,0,.12)}.t54-field small{display:block;color:#a9c3d5;font-size:11px}.t54-field strong{color:#eff9ff;font-size:14px;overflow-wrap:anywhere}.t54-ai-title{font-size:12px;letter-spacing:.06em;color:#8ee4d3;margin:14px 0 5px;font-weight:750}.t54-summary{font-size:14px;color:#c4dce9;line-height:1.5}.t54-warning{font-size:13px;color:#ffd18d;padding:10px 0}.t54-dialog{width:min(800px,94vw);max-height:90vh;overflow:auto;border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--text);padding:24px;box-shadow:0 25px 100px #0008}.t54-dialog::backdrop{background:#04131dcc;backdrop-filter:blur(5px)}.t54-editgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.t54-editgrid label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--muted)}.t54-editgrid input,.t54-editgrid select,.t54-editgrid textarea{width:100%;padding:9px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}.t54-editgrid .wide{grid-column:1/-1}.t54-dialog footer{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}.t54-source{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:var(--soft);border-radius:10px;font-size:14px}.t54-error{color:var(--red);margin-top:10px}@media(max-width:600px){.t54-editgrid{grid-template-columns:1fr}}\n</style><script>\nfunction t54Unwrap(v){try{for(let i=0;i<8;i++){if(typeof v===\'string\'){v=JSON.parse(v);continue}if(!v||typeof v!==\'object\')return null;if(v.structuredOutput){v=v.structuredOutput;continue}if(v.predictionOutput){v=v.predictionOutput;continue}if(\'category\' in v||\'pricing_formula\' in v||\'counterparty\' in v)return v;if(v.text){v=v.text;continue}return null}}catch(e){}return null}\nconst T54_LABELS={category:\'Category\',information_type:\'Information type\',counterparty:\'Counterparty\',region:\'Region\',pricing_index:\'Pricing index\',pricing_formula:\'Pricing formula\',contract_type:\'Contract type\',volume_mtpa:\'Volume (mtpa)\',start_year:\'Start year\',duration_years:\'Duration (years)\',confidence:\'AI extraction confidence\'};\nfunction t54Details(x){const ai=t54Unwrap(x.ai_extraction);if(!ai)return \'<div class="t54-warning">No usable AI extraction. You can enter the fields with Change before approval.</div>\';return \'<div class="t54-ai-title">\'+(x.ai_reviewed_at?\'REVIEWED PROPOSED FIELDS\':\'AI-PROPOSED FIELDS - REVIEW BEFORE APPROVAL\')+\'</div><div class="t54-fields">\'+Object.entries(T54_LABELS).map(([k,label])=>\'<div class="t54-field"><small>\'+t49Escape(label)+\'</small><strong>\'+t49Escape(ai[k]===null||ai[k]===undefined||ai[k]===\'\'?\'Not identified\':ai[k])+\'</strong></div>\').join(\'\')+\'</div>\'+(ai.counterparty_raw&&ai.counterparty_raw!==ai.counterparty?\'<div class="t54-summary">Original counterparty wording: \'+t49Escape(ai.counterparty_raw)+\'</div>\':\'\')+\'<div class="t54-summary">\'+t49Escape(ai.summary||\'\')+\'</div><div class="t54-summary">AI confidence concerns extraction only, not verification of the market information.</div>\'}\nconst t54BasePaint=t49Paint;\nt49Paint=function(){t54BasePaint();const visible=T49.items.filter(x=>T49.showProcessed||!x.processed);document.querySelectorAll(\'#t49Root .t53-card\').forEach((card,i)=>{const x=visible[i];if(!x)return;const message=card.querySelector(\'.t53-message\');if(message)message.textContent=x.original_message??x.message??\'\';const actions=card.querySelector(\'.t53-actions\');if(actions)actions.insertAdjacentHTML(\'beforebegin\',t54Details(x));const a=card.querySelector(\'a\');if(a){try{const u=new URL(x.message_link);if(u.protocol!==\'https:\'||![\'teams.microsoft.com\',\'teams.cloud.microsoft\'].includes(u.hostname))a.remove()}catch(e){a.remove()}}if(typeof oriModeCanWrite===\'function\'&&!oriModeCanWrite())card.querySelectorAll(\'button\').forEach(b=>b.disabled=true)})};\nasync function t49Action(id,action,extra={}){if(T49.actionBusy)return;T49.actionBusy=true;try{const d=await api(\'/api/teams-feed/action\',{message_id:id,action,...extra});if(d.reload_workspace){location.reload();return}await t49Load();toast(action===\'edit\'?\'Proposed fields saved.\':action===\'ignore\'?\'Message ignored.\':\'Message restored to inbox.\')}catch(e){toast(e.message)}finally{T49.actionBusy=false}}\nfunction t49Change(id){const item=T49.items.find(x=>x.message_id===id);if(!item)return;document.querySelector(\'#t54Dialog\')?.remove();const ai=t54Unwrap(item.ai_extraction)||{},dialog=document.createElement(\'dialog\');dialog.id=\'t54Dialog\';dialog.className=\'t54-dialog\';const form=document.createElement(\'form\');form.innerHTML=\'<h2>Review proposed LNG fields</h2><p>Correct the interpretation below. The original Teams message is preserved unchanged.</p><div class="t54-source"></div><div class="t54-editgrid"></div><div class="t54-error" role="alert"></div><footer><button type="button" data-cancel>Cancel</button><button type="submit" class="primary">Save proposed fields</button></footer>\';form.querySelector(\'.t54-source\').textContent=item.original_message??item.message??\'\';const grid=form.querySelector(\'.t54-editgrid\');const enums={category:[\'Pricing & Commercial\',\'Demand & Supply\',\'Policy & Regulation\',\'Market Reports\',\'Other\'],information_type:[\'Offer\',\'Bid\',\'Market indication\',\'Demand\',\'Supply\',\'Transaction\',\'Market observation\',\'Report\',\'Policy / Regulation\',\'Other\'],pricing_index:[\'HH\',\'JKM\',\'TTF\',\'Brent\',\'NBP\',\'THE\',\'Hybrid\',\'Other\'],contract_type:[\'SPA (DES)\',\'SPA (FOB)\',\'HOA\',\'MSPA\',\'Spot\',\'Other\'],confidence:[\'High\',\'Medium\',\'Low\']};const fields={...T54_LABELS,counterparty_raw:\'Counterparty as originally written\',summary:\'Summary\'};for(const [key,label]of Object.entries(fields)){const wrap=document.createElement(\'label\');wrap.textContent=label;let input;if(enums[key]){input=document.createElement(\'select\');for(const value of [\'\',...enums[key]]){const o=document.createElement(\'option\');o.value=value;o.textContent=value||\'Not identified\';input.append(o)}}else{input=document.createElement(key===\'summary\'?\'textarea\':\'input\');if(key===\'summary\'){input.rows=3;wrap.className=\'wide\'}else if([\'volume_mtpa\',\'start_year\',\'duration_years\'].includes(key)){input.type=\'number\';input.step=key===\'volume_mtpa\'?\'any\':\'1\';input.min=\'0\'}}input.name=key;input.value=ai[key]??\'\';wrap.append(input);grid.append(wrap)}form.querySelector(\'[data-cancel]\').onclick=()=>dialog.close();form.onsubmit=async e=>{e.preventDefault();const values={};for(const key of Object.keys(fields)){const value=form.elements.namedItem(key).value.trim();values[key]=value===\'\'?null:[\'volume_mtpa\',\'start_year\',\'duration_years\'].includes(key)?Number(value):value}const button=form.querySelector(\'[type=submit]\');button.disabled=true;try{await api(\'/api/teams-feed/action\',{message_id:id,action:\'edit\',ai_extraction:values});dialog.close();await t49Load();toast(\'Proposed fields saved. Review and approve when ready.\')}catch(err){form.querySelector(\'.t54-error\').textContent=err.message}finally{button.disabled=false}};dialog.append(form);dialog.addEventListener(\'close\',()=>dialog.remove());document.body.append(dialog);dialog.showModal()}\n</script>\n'
+HTML=HTML.replace('</body>',_TEAMS54_UI+'</body>')
+HTML=HTML.replace('LNG ORI Workspace v53','LNG ORI Workspace v54')
 
 if __name__=='__main__':main()
 
