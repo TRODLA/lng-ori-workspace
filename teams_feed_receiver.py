@@ -281,6 +281,170 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(503, {"error": "The Teams message could not be stored."})
 
 
+
+# Outlook ingestion shares the existing service/secret, but never Teams IDs or paths.
+def _outlook57_plain_html(value):
+    from html.parser import HTMLParser
+    class Reader(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+            self.skip = 0
+        def handle_starttag(self, tag, attrs):
+            if tag in ('script', 'style', 'head'):
+                self.skip += 1
+            if not self.skip and tag in ('p','div','br','tr','li','h1','h2','h3','blockquote'):
+                self.parts.append('\n')
+        def handle_endtag(self, tag):
+            if tag in ('script', 'style', 'head') and self.skip:
+                self.skip -= 1
+            if not self.skip and tag in ('p','div','tr','li','h1','h2','h3','blockquote'):
+                self.parts.append('\n')
+        def handle_data(self, data):
+            if not self.skip:
+                self.parts.append(data)
+    parser = Reader()
+    parser.feed(value)
+    return re.sub(r'\n[ \t]*\n(?:[ \t]*\n)+', '\n\n', ''.join(parser.parts)).strip()
+
+
+def _outlook57_link(value):
+    parsed = urlparse(str(value or '').strip())
+    if (parsed.scheme == 'https' and parsed.hostname in
+            ('outlook.office.com','outlook.office365.com','outlook.cloud.microsoft')
+            and not parsed.username and not parsed.password):
+        return str(value).strip()
+    return ''
+
+
+def store_outlook_message(body):
+    import hashlib
+    mailbox = str(body.get('mailbox') or '').strip().lower()
+    if not re.fullmatch(r'[^\s@/]+@[^\s@/]+\.[^\s@/]+', mailbox):
+        raise ValueError('A valid shared mailbox email address is required.')
+    message_id = str(body.get('message_id') or body.get('id') or '').strip()
+    internet_id = str(body.get('internet_message_id') or body.get('internetMessageId') or '').strip()
+    if not message_id or len(message_id) > 4096 or len(internet_id) > 4096:
+        raise ValueError('A valid email message_id is required (maximum 4096 characters).')
+    subject = str(body.get('subject') or '').strip()
+    html = body.get('body_html') or ''
+    text = body.get('body_text') or ''
+    if not html and not text and isinstance(body.get('body'), str):
+        if body.get('isHtml') is False:
+            text = body['body']
+        else:
+            html = body['body']
+    if not isinstance(html, str) or not isinstance(text, str):
+        raise ValueError('Email body must be text.')
+    if len(html) > 600000 or len(text) > 300000 or len(subject) > 2000:
+        raise ValueError('Email exceeds the supported size; attachments are not supported.')
+    plain = text.strip() if text.strip() else _outlook57_plain_html(html)
+    if not plain and not subject:
+        raise ValueError('An email subject or body is required.')
+    # Graph/connector IDs contain unsafe filename characters. A mailbox-scoped
+    # SHA-256 key is stable for replay and never embeds the raw email ID in a path.
+    key = hashlib.sha256((mailbox + '\n' + (internet_id or message_id)).encode('utf-8')).hexdigest()
+    timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    envelope = {
+        'schema_version': 4, 'source': 'Outlook', 'feed_id': key,
+        'message_id': message_id, 'internet_message_id': internet_id, 'mailbox': mailbox,
+        'subject': subject, 'sender': safe_text(body.get('sender') or body.get('from'), 500),
+        'sender_email': safe_text(body.get('sender_email') or body.get('from'), 500),
+        'created_at': safe_text(body.get('received_at') or body.get('created_at') or body.get('receivedDateTime'), 100),
+        'received_at': timestamp, 'message': plain, 'original_message': plain,
+        'original_html': html, 'message_link': _outlook57_link(body.get('message_link')),
+        'processed': False, 'ai_status': 'not_provided', 'ai_extraction': None,
+        'attachments_processed': False,
+    }
+    if body.get('ai_extraction') not in (None, ''):
+        try:
+            raw = _feed_ai_unwrap(body['ai_extraction'])
+            if raw is not None:
+                ai = _feed_ai_validate(raw)
+                envelope.update(ai_status='completed', ai_extraction=ai,
+                    ai_original_extraction=ai.copy(), ai_provider='Power Automate AI Builder',
+                    ai_processed_at=timestamp)
+        except (ValueError, TypeError, OverflowError) as exc:
+            envelope.update(ai_status='invalid', ai_error=str(exc)[:500])
+    base = os.getenv('AZURE_STORAGE_BASE_DIRECTORY', 'origination').strip('/')
+    path = '/'.join(x for x in (base, 'outlook_feed', key + '.json') if x)
+    client = storage_container().get_blob_client(path)
+    settings = ContentSettings(content_type='application/json; charset=utf-8')
+    created, enriched = False, False
+    def encoded(item):
+        return json.dumps(item, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    try:
+        client.upload_blob(encoded(envelope), overwrite=False, content_settings=settings)
+        created = True
+    except ResourceExistsError:
+        for attempt in range(3):
+            download = client.download_blob()
+            existing = json.loads(download.readall().decode('utf-8'))
+            if (not existing.get('processed') and not existing.get('edited_at')
+                    and not existing.get('ai_reviewed_at')
+                    and existing.get('ai_status') != 'completed'
+                    and envelope['ai_status'] == 'completed'):
+                for name in ('ai_status','ai_extraction','ai_original_extraction','ai_provider','ai_processed_at'):
+                    existing[name] = envelope[name]
+                existing.pop('ai_error', None)
+                try:
+                    client.upload_blob(encoded(existing), overwrite=True, content_settings=settings,
+                        etag=download.properties.etag, match_condition=MatchConditions.IfNotModified)
+                    enriched = True
+                except ResourceModifiedError:
+                    if attempt < 2:
+                        continue
+                    raise
+            envelope = existing
+            break
+    return {'ok': True, 'source': 'Outlook', 'created': created, 'enriched_existing': enriched,
+        'feed_id': key, 'message_id': message_id, 'blob_path': path,
+        'ai_status': envelope.get('ai_status', 'not_provided'),
+        'ai_extraction': envelope.get('ai_extraction'), 'ai_error': envelope.get('ai_error')}
+
+
+_TEAMS57_POST = Handler.do_POST
+_TEAMS57_GET = Handler.do_GET
+
+def _outlook57_get(handler):
+    if urlparse(handler.path).path == '/healthz':
+        handler.send_json(200, {'ok': True, 'service': 'ori-market-feed-receiver',
+            'sources': ['Teams','Outlook'], 'accepts_ai_extraction': True})
+        return
+    return _TEAMS57_GET(handler)
+
+
+def _outlook57_post(handler):
+    if urlparse(handler.path).path != '/api/outlook-feed/ingest':
+        return _TEAMS57_POST(handler)
+    try:
+        # Reuse the existing authenticated ingestion connection. No new Radix
+        # secret is needed. Do not change the Teams flow or its header.
+        expected = required('TEAMS_FEED_INGEST_SECRET')
+        supplied = handler.headers.get('X-ORI-Teams-Feed-Key', '').strip()
+        if not supplied or not hmac.compare_digest(expected, supplied):
+            handler.send_json(403, {'error': 'Invalid feed key.'})
+            return
+        if handler.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            raise ValueError('Expected application/json.')
+        length = int(handler.headers.get('Content-Length', '0'))
+        if length <= 0 or length > MAX_BODY:
+            raise ValueError('Request body is empty or too large.')
+        body = json.loads(handler.rfile.read(length))
+        if not isinstance(body, dict):
+            raise ValueError('Expected a JSON object.')
+        result = store_outlook_message(body)
+        handler.send_json(201 if result['created'] else 200, result)
+    except (ValueError, TypeError) as exc:
+        handler.send_json(400, {'error': str(exc)})
+    except Exception as exc:
+        print('Outlook feed ingestion failed:', type(exc).__name__, flush=True)
+        handler.send_json(503, {'error': 'The Outlook message could not be stored.'})
+
+Handler.do_GET = _outlook57_get
+Handler.do_POST = _outlook57_post
+Handler.server_version = 'ORI-MarketFeed/4.0'
+
 if __name__ == "__main__":
     print(f"Starting Teams feed receiver with AI Builder payload support on port {PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
