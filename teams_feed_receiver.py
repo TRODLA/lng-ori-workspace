@@ -360,6 +360,7 @@ def store_outlook_message(body):
         'attachments_processed': False,
     }
     envelope.update(_feed63_metadata(body, 'Outlook'))
+    envelope.update(body.get('_reply64_metadata') or {})
     if body.get('ai_extraction') not in (None, ''):
         try:
             raw = _feed_ai_unwrap(body['ai_extraction'])
@@ -473,6 +474,44 @@ def _feed63_metadata(body, source):
     return {'message_link':link, 'attachment_names':names,
             'has_attachments':bool(body.get('hasAttachments') or body.get('has_attachments') or names),
             'attachments_processed':False, 'source_link_supplied':bool(link)}
+
+
+# V64: preserve reply-specific text as separate metadata. No upstream AI rerun.
+def _feed64_reply(body, original):
+    supplied=body.get('latest_reply_text') or body.get('unique_body') or body.get('uniqueBody')
+    if isinstance(supplied,dict):
+        content=supplied.get('content','')
+        latest=_outlook57_plain_html(content) if str(supplied.get('contentType','')).lower()=='html' else str(content)
+    elif isinstance(supplied,str):
+        latest=_outlook57_plain_html(supplied) if re.search(r'<(?:p|div|br)\b',supplied,re.I) else supplied
+    else:
+        latest=''
+    # Only a conservative top-posted boundary; inline replies remain untouched.
+    boundary=re.search(r'(?im)^\s*(?:-{2,}\s*(?:Original Message|Forwarded message)\s*-*|On .{5,180}wrote:|From:\s*[^\n]+\n(?:Sent:|Date:))',original)
+    if not latest and boundary and boundary.start()>0:
+        latest=original[:boundary.start()].strip()
+    reply=bool(re.match(r'^\s*re\s*:',str(body.get('subject') or ''),re.I) or body.get('in_reply_to') or body.get('inReplyTo') or boundary)
+    if len(latest)>100000:
+        raise ValueError('Latest reply text exceeds 100000 characters.')
+    return {'latest_reply_text':latest.strip(),'is_reply':reply,
+            'conversation_id':safe_text(body.get('conversation_id') or body.get('conversationId'),4096),
+            'in_reply_to':safe_text(body.get('in_reply_to') or body.get('inReplyTo'),4096),
+            'reply_notice':('Newest reply text is shown separately. Verify that the AI summary covers this reply, not just the quoted original. If not, map the current reply body into MarketMessage in Power Automate.' if reply else '')}
+
+_FEED64_OUTLOOK_STORE=store_outlook_message
+
+def store_outlook_message(body):
+    # Individual message/internet-message IDs still drive the existing key.
+    # Conversation IDs are context only, never used as the deduplication key.
+    original_text=body.get('body_text') or ''
+    if not original_text:
+        original_text=_outlook57_plain_html(str(body.get('body_html') or body.get('body') or ''))
+    metadata=_feed64_reply(body,str(original_text))
+    # Metadata is injected before the existing atomic create; replays retain
+    # processed/manually reviewed envelopes and their original source.
+    payload=dict(body)
+    payload['_reply64_metadata']=metadata
+    return _FEED64_OUTLOOK_STORE(payload)
 
 if __name__ == "__main__":
     print(f"Starting Teams feed receiver with AI Builder payload support on port {PORT}", flush=True)
