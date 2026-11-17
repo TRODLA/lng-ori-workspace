@@ -5008,6 +5008,421 @@ _LEADS62_UI='<style>/* V62: cargo-size bounds retain readable text and fit the e
 HTML=HTML.replace('</body>',_LEADS62_UI+'</body>')
 HTML=HTML.replace('LNG ORI Workspace v61','LNG ORI Workspace v62')
 
+
+# V63: source-aware review, conservative matching and provenance.
+# All writes still use the existing authenticated routes, save(), ETags and audit.
+_F63_FIELDS = ('counterparty','region','pricing_index','pricing_formula','contract_type',
+               'volume_mtpa','start_year','duration_years')
+_F63_TEAMS_APPLY = _teams49_apply
+_F63_OUTLOOK_APPLY = _outlook57_apply
+_F63_GET = Handler.do_GET
+_F63_POST = Handler.do_POST
+
+
+def _f63_norm(value):
+    import unicodedata
+    value = ' '.join(re.findall(r'[^\W_]+', unicodedata.normalize('NFKC', str(value or '')).casefold(), re.UNICODE))
+    return 'ptt' if value == 'pttt' else value
+
+
+def _f63_present(value):
+    return value is not None and value != ''
+
+
+def _f63_equal(field, left, right):
+    if field in ('volume_mtpa','start_year','duration_years'):
+        try:
+            from decimal import Decimal, InvalidOperation
+            return Decimal(str(left)) == Decimal(str(right))
+        except (InvalidOperation, ValueError, TypeError):
+            return False
+    if field == 'pricing_formula':
+        # Never erase arithmetic signs: HH + 4.25 differs from HH - 4.25.
+        def formula(value):
+            return re.sub(r'\s+', '', str(value or '').casefold().replace('−','-').replace('–','-'))
+        return formula(left) == formula(right)
+    return _f63_norm(left) == _f63_norm(right)
+
+
+def _f63_active(x):
+    return not (x.get('workflow_archived') or x.get('workflow_state') == 'archived'
+                or x.get('market_archived') or x.get('archived') is True)
+
+
+def _f63_targets(workspace):
+    rows = []
+    for typ, col in (('lead','records'),('tender','tenders')):
+        for x in workspace.get(col, []):
+            if not _f63_active(x):
+                continue
+            if typ == 'tender' and str(x.get('status') or '').casefold() in ('cancelled','closed','completed','signed'):
+                continue
+            rows.append((typ, x))
+    return rows
+
+
+def _f63_cp_names(cp):
+    names = [cp.get('name'), cp.get('company_name')]
+    aliases = cp.get('aliases', [])
+    if isinstance(aliases, str):
+        aliases = [a.strip() for a in re.split(r'[;\n]', aliases)]
+    if isinstance(aliases, list):
+        names += [a for a in aliases if isinstance(a, str)]
+    return {_f63_norm(n) for n in names if _f63_norm(n)}
+
+
+def _f63_cp(workspace, x):
+    cps = [c for c in workspace.get('counterparts', []) if _f63_active(c)]
+    if x.get('counterpart_id'):
+        return next((c for c in cps if c.get('id') == x['counterpart_id']), None)
+    name = _f63_norm(x.get('counterpart'))
+    matches = [c for c in cps if name and name in _f63_cp_names(c)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _f63_link(value, source):
+    parsed = urlparse(str(value or '').strip())
+    hosts = ('outlook.office.com','outlook.office365.com','outlook.cloud.microsoft') if source == 'Outlook' else ('teams.microsoft.com','teams.cloud.microsoft')
+    if parsed.scheme == 'https' and parsed.hostname in hosts and not parsed.username and not parsed.password:
+        return str(value).strip()
+    return ''
+
+
+def _f63_read(source, ident):
+    if source == 'Outlook':
+        return _outlook57_read(_outlook57_id(ident))
+    if source != 'Teams':
+        raise ValueError('Choose Teams or Outlook.')
+    ident = _teams48_safe_id(ident)
+    download = _storage_container().get_blob_client(_teams49_blob_path(ident)).download_blob()
+    item = json.loads(download.readall().decode('utf-8'))
+    if not isinstance(item, dict) or item.get('message_id') != ident:
+        raise ValueError('Invalid Teams feed record.')
+    item['_etag'] = download.properties.etag
+    return item
+
+
+def _f63_write(source, item):
+    if source == 'Outlook':
+        return _outlook57_write(item)
+    raw = json.dumps({k:v for k,v in item.items() if not k.startswith('_')}, ensure_ascii=False, allow_nan=False).encode('utf-8')
+    try:
+        _storage_container().get_blob_client(_teams49_blob_path(item['message_id'])).upload_blob(
+            raw, overwrite=True, etag=item['_etag'], match_condition=MatchConditions.IfNotModified)
+    except ResourceModifiedError as exc:
+        raise ValueError('This message changed during review. Refresh the feed and review again.') from exc
+
+
+def _f63_digest(item):
+    import hashlib
+    evidence = {k:item.get(k) for k in ('message_id','feed_id','subject','original_message','message',
+                'ai_extraction','ai_status','ai_reviewed_at','edited_at','message_link')}
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def _f63_ai(item):
+    try:
+        return _feed54_ai(item) or {}
+    except (ValueError, TypeError, OverflowError):
+        return {}
+
+
+def _f63_kind(item, ai):
+    if ai.get('category') == 'Market Reports' or ai.get('information_type') == 'Report':
+        return 'report'
+    text = str(item.get('subject') or '') + '\n' + str(ai.get('summary') or '')[:1200]
+    if re.search(r'\b(?:meeting (?:minutes|summary|notes)|minutes of (?:the )?meeting|mom|call notes|meeting with|discussion with)\b', text, re.I):
+        return 'meeting'
+    return 'update'
+
+
+def _f63_terms(x):
+    m = x.get('market45') if isinstance(x.get('market45'), dict) else {}
+    formula = x.get('pricing') or x.get('pricing_formula') or m.get('custom_formula') or ''
+    index = x.get('pricing_index') or x.get('index') or ''
+    if not index and isinstance(formula, str):
+        hits = {h.upper() for h in re.findall(r'\b(HH|TTF|JKM|Brent|NBP|THE)\b', formula, re.I)}
+        index = 'Hybrid' if len(hits) > 1 else ('Brent' if hits == {'BRENT'} else next(iter(hits), ''))
+    contract = x.get('contract_type') or m.get('contract_type') or ''
+    structure = str(x.get('structure') or '').strip()
+    if not contract and structure in ('SPA (DES)','SPA (FOB)','HOA','MSPA','Spot','Other'):
+        contract = structure
+    if not contract and structure.upper() == 'SPA' and x.get('delivery') in ('FOB','DES'):
+        contract = 'SPA (' + x['delivery'] + ')'
+    def number(value, integer=False):
+        if value in (None, '') or isinstance(value, bool):
+            return None
+        try:
+            n = float(value)
+            if not math.isfinite(n) or n < 0 or (integer and not n.is_integer()):
+                return None
+            return int(n) if integer else n
+        except (ValueError, TypeError, OverflowError):
+            return None
+    duration = number(x.get('number_of_years'), True)
+    if duration is None:
+        duration = number(x.get('duration_years') or m.get('duration_years'), True)
+    if duration is None:
+        match = re.fullmatch(r'\s*(\d+)\s*(?:years?|yrs?|y)\s*', str(x.get('tenor') or ''), re.I)
+        if match:
+            duration = int(match.group(1))
+    if duration is not None and not 1 <= duration <= 100:
+        duration = None
+    return {'counterparty': x.get('counterpart') or '', 'region': x.get('region') or '',
+            'pricing_index': index, 'pricing_formula': formula if isinstance(formula, str) else '',
+            'contract_type': contract, 'volume_mtpa': number(x.get('volume_mtpa', m.get('volume_mtpa'))),
+            'start_year': number(x.get('start_year', m.get('start_year')), True) if 1900 <= (number(x.get('start_year', m.get('start_year')), True) or 0) <= 2200 else None,
+            'duration_years': duration}
+
+
+def _f63_candidates(item, workspace, ai, kind):
+    if kind == 'report':
+        return [], None, None, 'General report: no primary counterparty or opportunity is proposed.'
+    names = {_f63_norm(ai.get(k)) for k in ('counterparty','counterparty_raw') if _f63_norm(ai.get(k))}
+    cps = [c for c in workspace.get('counterparts', []) if _f63_active(c) and names & _f63_cp_names(c)]
+    cp = cps[0] if len(cps) == 1 else None
+    # Use the interpreted subject/summary, not signatures or a quoted thread,
+    # for name evidence. No fuzzy substring or headquarters-based matching.
+    text = ' ' + _f63_norm(str(item.get('subject') or '') + '\n' + str(ai.get('summary') or '')) + ' '
+    candidates = []
+    for typ, x in _f63_targets(workspace):
+        xcp = _f63_cp(workspace, x)
+        same_cp = bool(cp and xcp and cp['id'] == xcp['id']) or bool(_f63_norm(x.get('counterpart')) in names and _f63_norm(x.get('counterpart')))
+        name = str(x.get('name') or x.get('title') or '')
+        norm = _f63_norm(name)
+        distinctive = len(norm) >= 10 and len(norm.split()) >= 2
+        named = distinctive and (' ' + norm + ' ') in text
+        if not same_cp and not named:
+            continue
+        reasons = []
+        if named:
+            reasons.append('Distinctive opportunity name appears in subject/summary')
+        if same_cp:
+            reasons.append('Exact counterparty name or configured alias')
+        terms = _f63_terms(x)
+        agreement = [k for k in ('region','pricing_index','pricing_formula','start_year','duration_years')
+                     if _f63_present(ai.get(k)) and _f63_present(terms.get(k)) and _f63_equal(k, ai[k], terms[k])]
+        if agreement:
+            reasons.append('Matching terms: ' + ', '.join(agreement))
+        candidates.append({'ref':{'type':typ,'id':x['id']},'name':name,'counterparty':x.get('counterpart') or (xcp or {}).get('name') or '',
+                           'reason':'; '.join(reasons), 'named':named,'same_counterparty':same_cp,
+                           'score':(100 if named else 0)+(20 if same_cp else 0)+len(agreement)})
+    candidates.sort(key=lambda c:(-c['score'],c['name'].casefold(),c['ref']['id']))
+    named = [c for c in candidates if c['named']]
+    suggestion = named[0]['ref'] if len(named) == 1 else candidates[0]['ref'] if len(candidates) == 1 else None
+    reason = 'Candidate only: confirm the association before approval.' if suggestion else 'Several plausible opportunities: select one or leave unassigned.' if candidates else 'No reliable workspace match. Leave unassigned or select an existing record manually.'
+    return candidates[:50], suggestion, cp['id'] if cp else None, reason
+
+
+def _f63_preview(item, source, workspace, selection=None):
+    ai = _f63_ai(item)
+    kind = _f63_kind(item, ai)
+    candidates, suggestion, cp_suggestion, reason = _f63_candidates(item, workspace, ai, kind)
+    selection = selection if isinstance(selection, dict) else {}
+    chosen = selection.get('ref', suggestion)
+    cp_id = selection.get('counterpart_id', cp_suggestion)
+    if kind == 'report':
+        if chosen or cp_id:
+            raise ValueError('General reports must remain unassigned to a primary lead/counterparty.')
+        chosen = None
+        cp_id = None
+    target = None
+    if chosen:
+        if not isinstance(chosen, dict) or chosen.get('type') not in ('lead','tender') or not isinstance(chosen.get('id'), str):
+            raise ValueError('Invalid linked opportunity.')
+        target = next((x for typ,x in _f63_targets(workspace) if typ == chosen['type'] and x['id'] == chosen['id']), None)
+        if target is None:
+            raise ValueError('The selected opportunity is no longer active. Review again.')
+        target_cp = _f63_cp(workspace, target)
+        if target_cp:
+            if cp_id and cp_id != target_cp['id']:
+                raise ValueError('The selected counterparty differs from the linked opportunity. Choose a consistent association.')
+            cp_id = target_cp['id']
+        elif cp_id and _f63_norm(target.get('counterpart')):
+            selected_cp = next((c for c in workspace.get('counterparts', []) if c['id'] == cp_id), None)
+            if selected_cp and _f63_norm(target['counterpart']) not in _f63_cp_names(selected_cp):
+                raise ValueError('The selected counterparty differs from the linked opportunity.')
+    cp = next((c for c in workspace.get('counterparts', []) if c.get('id') == cp_id and _f63_active(c)), None) if cp_id else None
+    if cp_id and cp is None:
+        raise ValueError('The selected counterparty is no longer available.')
+    terms = _f63_terms(target) if target else {}
+    if cp and not terms.get('counterparty'):
+        terms['counterparty'] = cp.get('name') or ''
+    fields = []
+    for key in _F63_FIELDS:
+        reported = ai.get(key)
+        if kind == 'report' and key != 'region':
+            reported = None
+        context = terms.get(key)
+        # No commercial enrichment from a counterparty alone.
+        if not target and key != 'counterparty':
+            context = None
+        value = reported if _f63_present(reported) else context if _f63_present(context) else None
+        origin = 'message' if _f63_present(reported) else 'linked_record' if target and _f63_present(context) else 'counterparty_record' if cp and _f63_present(context) else 'not_recorded'
+        conflict = _f63_present(reported) and _f63_present(context) and not _f63_equal(key, reported, context)
+        fields.append({'field':key,'reported':reported,'linked':context,'value':value,'origin':origin,'conflict':bool(conflict)})
+    link = _f63_link(item.get('message_link'), source)
+    return {'source':source,'source_digest':_f63_digest(item),'workspace_revision':workspace.get('revision',0),
+            'subject':str(item.get('subject') or ''),'summary':str(ai.get('summary') or ''),
+            'category':'Market Reports' if kind == 'report' else ai.get('category') or 'Other','information_type':ai.get('information_type') or 'Other',
+            'source_kind':kind,'candidates':candidates,'suggested_ref':suggestion,
+            'selected_ref':chosen,'selected_counterpart_id':cp_id,'match_explanation':reason,
+            'selected_name':(target or {}).get('name') or (target or {}).get('title') or '',
+            'fields':fields,'source_link':link,'original':str(item.get('original_message') or item.get('message') or ''),
+            'attachment_notice':'Attachments have not been processed by this integration.' if source == 'Outlook' else '',
+            'processed':bool(item.get('processed'))}
+
+
+def _f63_title(summary, fallback):
+    text = next((line.strip(' -*\t') for line in summary.splitlines() if line.strip()), '') or fallback
+    return re.split(r'(?<=[.!?])\s+(?=[A-Z])', text, maxsplit=1)[0][:180]
+
+
+def _f63_record(item, source, action, actor, preview, body):
+    safe_item = copy.deepcopy(item)
+    safe_item['ai_extraction'] = _f63_ai(item) or None
+    record = _outlook57_record(safe_item, action, actor) if source == 'Outlook' else _feed54_record(safe_item, action, actor)
+    summary = body.get('summary')
+    if not isinstance(summary, str) or not summary.strip() or len(summary) > 3000:
+        raise ValueError('Add a concise reviewed summary (maximum 3000 characters).')
+    summary = summary.strip()
+    destination = body.get('destination') or ('idea' if action == 'idea' else 'insight')
+    if destination not in ('insight','idea','interaction') or (action == 'idea' and destination != 'idea'):
+        raise ValueError('Invalid approval destination.')
+    if preview['source_kind'] == 'report' and destination == 'interaction':
+        raise ValueError('A general report cannot be saved as a counterparty interaction.')
+    record['title'] = _f63_title(summary, str(item.get('subject') or 'Market information'))
+    if any(f['conflict'] for f in preview['fields']) and body.get('acknowledge_conflicts') is not True:
+        raise ValueError('Review and acknowledge the differences between message and linked record.')
+    record['summary'] = summary
+    record['body'] = summary
+    if action == 'insight':
+        record['observation'] = summary
+        record['interpretation'] = ''
+    else:
+        record['interesting'] = summary
+        record['known'] = ''
+    cp_id = preview['selected_counterpart_id']
+    chosen = preview['selected_ref']
+    record['linked_deals'] = [copy.deepcopy(chosen)] if chosen else []
+    if chosen:
+        record['lead_id' if chosen['type'] == 'lead' else 'tender_id'] = chosen['id']
+    if cp_id:
+        record['counterpart_id'] = cp_id
+    values = {f['field']:f['value'] for f in preview['fields']}
+    record['counterpart'] = values['counterparty'] or ''
+    record['region'] = values['region'] or ''
+    record['index'] = values['pricing_index'] or ''
+    market = record['market45']
+    market['category'] = preview['category']
+    if preview['source_kind'] == 'report':
+        market['information_type'] = 'Report'
+    for field, key in (('contract_type','contract_type'),('volume_mtpa','volume_mtpa'),('start_year','start_year'),('duration_years','duration_years'),('pricing_formula','custom_formula')):
+        market[key] = values[field] if values[field] is not None else '' if key in ('contract_type','custom_formula') else None
+    # Inherited prices are context, never a fresh market indication/chart point.
+    if preview['source_kind'] in ('report','meeting') or not _f63_present(_f63_ai(item).get('pricing_formula')):
+        market.pop('pricing', None)
+    link = preview['source_link']
+    record['reference_links'] = [{'url':link,'title':'Open source email (mailbox access required)' if source == 'Outlook' else 'Open source Teams message'}] if link else []
+    record['feed_review'] = {'version':63,'source':source,'source_kind':preview['source_kind'],
+        'summary':summary,'summary_origin':'AI proposal reviewed by user' if _f63_ai(item).get('summary') else 'Reviewer supplied summary','source_digest':preview['source_digest'],
+        'selected_ref':copy.deepcopy(chosen),'selected_name':preview['selected_name'],
+        'counterpart_id':cp_id,'fields':copy.deepcopy(preview['fields']),
+        'reviewed_by':actor,'reviewed_at':now(),'source_link':link,
+        'source_link_notice':'Mailbox access is required; this link does not grant access.' if source == 'Outlook' else '',
+        'attachment_notice':preview['attachment_notice']}
+    collection = 'ideas' if destination == 'idea' else 'intelligence'
+    if destination == 'interaction':
+        if not cp_id:
+            raise ValueError('A counterpart interaction requires an existing selected counterparty.')
+        collection = 'communications'
+        record.update(interaction_kind='counterpart_interaction', type='Meeting' if preview['source_kind']=='meeting' else 'Email' if source=='Outlook' else 'Discussion',
+                      location_type='Other', location='Meeting format not inferred from the source channel.',
+                      participants='', key_information=record['title'])
+        market['kind'] = 'Interaction'
+    return record, collection
+
+
+def _f63_approve(source, body, actor):
+    action = str(body.get('action') or '')
+    if action not in ('insight','idea'):
+        raise ValueError('Invalid approval action.')
+    ident = body.get('feed_id') if source == 'Outlook' else body.get('message_id')
+    item = _f63_read(source, ident)
+    if item.get('processed'):
+        return {'ok':True,'already_processed':True,'item':_outlook57_public(item)}
+    identity_key = 'outlook_feed_id' if source == 'Outlook' else 'teams_message_id'
+    identity_value = item['feed_id'] if source == 'Outlook' else item['message_id']
+    for attempt in range(4):
+        with LOCK:
+            old = state()
+            existing = next((x for col in ('intelligence','ideas','communications') for x in old.get(col, []) if x.get(identity_key)==identity_value), None)
+            if existing:
+                ident_saved = existing['id']
+                break
+            if body.get('source_digest') != _f63_digest(item):
+                raise ValueError('The source or AI fields changed. Open Review & approve again.')
+            if body.get('workspace_revision') != old.get('revision',0):
+                raise ValueError('The workspace changed during review. Refresh the review before approving.')
+            preview = _f63_preview(item, source, old, {'ref':body.get('selected_ref'), 'counterpart_id':body.get('counterpart_id')})
+            record, collection = _f63_record(item, source, action, actor, preview, body)
+            n = copy.deepcopy(old)
+            n.setdefault(collection, []).insert(0, record)
+            n.setdefault('history', []).append({'at':now(),'actor':actor,'entity':collection,'id':record['id'],
+                'title':record['title'],'change':'Reviewed '+source+' feed approval with source/linked-record provenance',
+                'before':None,'after':copy.deepcopy(record)})
+            try:
+                save(n, old)
+                ident_saved = record['id']
+                break
+            except _SharedWorkspaceRace:
+                if attempt == 3:
+                    raise ValueError('The workspace is busy. Refresh the review and try again.')
+    item.update(processed=True, processing_action=action, processed_at=now(), processed_by=actor, workspace_item_id=ident_saved)
+    _f63_write(source, item)
+    return {'ok':True,'item':_outlook57_public(item),'workspace_item_id':ident_saved,'reload_workspace':True}
+
+
+def _teams49_apply(body, actor):
+    if body.get('action') in ('insight','idea'):
+        return _f63_approve('Teams', body, actor)
+    return _F63_TEAMS_APPLY(body, actor)
+
+
+def _outlook57_apply(body, actor):
+    if body.get('action') in ('insight','idea'):
+        return _f63_approve('Outlook', body, actor)
+    return _F63_OUTLOOK_APPLY(body, actor)
+
+
+def _f63_post(handler):
+    if urlparse(handler.path).path != '/api/market-feed/review':
+        return _F63_POST(handler)
+    try:
+        if not handler.host_ok() or not handler.origin_ok(handler.headers.get('Origin')):
+            raise PermissionError('Invalid request origin.')
+        if not _valid_request_token(handler.headers.get('X-ORI-Token')):
+            handler.send(403, {'error':'Refresh the page security token.','code':'invalid_request_token'})
+            return
+        _auth_require(handler, READ_ROLES)
+        body = _v28_read_body(handler, 100000)
+        source = body.get('source')
+        item = _f63_read(source, body.get('id'))
+        handler.send(200, _f63_preview(item, source, state(), body.get('selection')))
+    except PermissionError as exc:
+        handler.send(403, {'error':str(exc)})
+    except ValueError as exc:
+        handler.send(400, {'error':str(exc)})
+    except Exception as exc:
+        print('Feed review failed:', type(exc).__name__, flush=True)
+        handler.send(503, {'error':'The feed review could not be loaded. Refresh and try again.'})
+
+Handler.do_POST = _f63_post
+
+_MARKET63_UI='<style>.f63-dialog{width:min(1120px,96vw);max-height:93vh;overflow:auto;padding:0;border:1px solid #456c84;border-radius:19px;background:var(--panel,#102536);color:var(--text,#e8f1fa);box-shadow:0 28px 100px #0008}.f63-dialog::backdrop{background:#021321cc;backdrop-filter:blur(5px)}.f63-dialog>header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:23px 26px 16px;border-bottom:1px solid var(--line)}.f63-dialog h2{font-size:22px;margin:6px 0 0}.f63-dialog h3{font-size:15px;margin:22px 0 12px}.f63-eyebrow{font-size:10px;letter-spacing:.13em;color:var(--blue);font-weight:750}.f63-dialog [data-close]{font-size:23px;line-height:1;padding:5px 10px}.f63-body{padding:20px 26px 24px}.f63-tags{display:flex;gap:8px;flex-wrap:wrap}.f63-tags span{padding:4px 9px;border:1px solid var(--line);border-radius:7px;font-size:11px;color:var(--blue)}.f63-note{font-size:12px;color:var(--muted);line-height:1.6}.f63-summary-label{display:flex;flex-direction:column;gap:8px;font-size:13px;font-weight:650}.f63-summary-label textarea{width:100%;min-height:145px;resize:vertical;line-height:1.6;padding:12px;border-radius:10px;background:var(--bg);color:var(--text);border:1px solid var(--line);font:inherit;font-weight:400}.f63-grid{display:grid;grid-template-columns:1.5fr 1fr 1fr;gap:12px;margin:18px 0 10px}.f63-grid label{display:flex;flex-direction:column;gap:7px;font-size:12px}.f63-grid select{width:100%;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px;font:inherit}.f63-table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}.f63-table{width:100%;border-collapse:collapse;font-size:12px;min-width:640px}.f63-table th,.f63-table td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left;max-width:270px;overflow-wrap:anywhere}.f63-table thead th{background:var(--soft);font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.f63-table tbody th{font-weight:600}.f63-table td small{display:block;color:var(--muted);font-size:10px;margin-top:4px}.f63-table tr:last-child>*{border-bottom:0}.f63-conflict{background:#d69b2112}.f63-conflict td:last-child small{color:var(--gold,#d7a44e);font-weight:700}.f63-ack{display:flex;align-items:flex-start;gap:9px;padding:12px;border:1px solid var(--gold);border-radius:8px;font-size:12px;margin-top:13px}.f63-ack input{margin-top:3px}.f63-original{margin:18px 0 12px;border-top:1px solid var(--line);padding-top:13px}.f63-original summary,.f63-candidates summary{cursor:pointer;color:var(--blue);font-size:12px;font-weight:600}.f63-original pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:350px;overflow:auto;font:12px/1.65 \'Segoe UI\',Arial,sans-serif;background:var(--bg);padding:13px;border-radius:9px}.f63-original a,.f63-saved-source>a{font-size:12px;color:var(--blue)}.f63-notice{padding:9px 12px;border-radius:8px;background:var(--soft);color:var(--muted);font-size:11px;line-height:1.6}.f63-error{font-size:12px;color:var(--red);white-space:pre-wrap}.f63-dialog footer{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap;margin-top:18px}.f63-dialog button{font:inherit;font-size:12px;cursor:pointer;border:1px solid var(--line);border-radius:8px;padding:9px 13px;background:var(--soft);color:var(--text)}.f63-dialog button.primary{background:#0876e8;color:white;border-color:#0876e8}.f63-dialog button:disabled{opacity:.55;cursor:wait}.f63-candidates{font-size:12px;margin-top:12px}.f63-candidates p{padding:8px;background:var(--soft);border-radius:6px}.f63-saved-source{margin-top:22px;padding-top:15px;border-top:1px solid var(--line)}.f63-saved-source h3{font-size:15px}.f63-saved-source>button{margin:12px 0}.f63-dialog :focus-visible{outline:3px solid var(--blue);outline-offset:3px}\n@media(max-width:800px){.f63-grid{grid-template-columns:1fr}.f63-body{padding:16px}.f63-dialog>header{padding:18px 16px}.f63-dialog h2{font-size:19px}}\n</style><script>// V63: review before approval. All DOM source text is escaped or textContent.\nconst F63={dialog:null,busy:false,request:0};\nconst F63_LABELS={counterparty:\'Counterparty\',region:\'Region\',pricing_index:\'Pricing index\',pricing_formula:\'Pricing formula\',contract_type:\'Contract type\',volume_mtpa:\'Volume (mtpa)\',start_year:\'Start year\',duration_years:\'Duration (years)\'};\nfunction f63Value(v){return v===null||v===undefined||v===\'\'?\'Not recorded\':String(v)}\nfunction f63Origin(v){return {message:\'From message\',linked_record:\'From linked lead/tender\',counterparty_record:\'From counterparty record\',not_recorded:\'Not recorded\'}[v]||v}\nfunction f63Fields(fields){return \'<div class="f63-table-wrap"><table class="f63-table"><thead><tr><th>Field</th><th>Message</th><th>Linked record</th><th>Proposed value / basis</th></tr></thead><tbody>\'+(fields||[]).map(f=>\'<tr class="\'+(f.conflict?\'f63-conflict\':\'\')+\'"><th scope="row">\'+E(F63_LABELS[f.field]||f.field)+\'</th><td>\'+E(f63Value(f.reported))+\'</td><td>\'+E(f63Value(f.linked))+\'</td><td><strong>\'+E(f63Value(f.value))+\'</strong><small>\'+E(f63Origin(f.origin))+(f.conflict?\' · DIFFERENCE TO REVIEW\':\'\')+\'</small></td></tr>\').join(\'\')+\'</tbody></table></div>\'}\nfunction f63RefKey(ref){return ref?ref.type+\':\'+ref.id:\'\'}\nfunction f63Ref(value){if(!value)return null;const i=value.indexOf(\':\');return {type:value.slice(0,i),id:value.slice(i+1)}}\nfunction f63Targets(){return [...(S.records||[]).filter(x=>!wfArchived(x)&&!x.market_archived&&x.archived!==true).map(x=>({ref:{type:\'lead\',id:x.id},name:x.name||x.title||\'Untitled lead\',counterparty:x.counterpart||\'\'})),...(S.tenders||[]).filter(x=>!wfArchived(x)&&!x.market_archived&&x.archived!==true&&!/^(cancelled|closed|completed|signed)$/i.test(x.status||\'\')).map(x=>({ref:{type:\'tender\',id:x.id},name:x.name||x.title||\'Untitled tender\',counterparty:x.counterpart||\'\'}))].sort((a,b)=>a.name.localeCompare(b.name))}\nasync function f63Review(source,id,action=\'insight\'){\n if(!oriModeCanWrite()){toast(\'Writer or Administrator access is required.\');return}\n if(editor||saving){toast(\'Save or close the current editor first.\');return}\n if(F63.dialog?.isConnected){F63.dialog.focus();return}\n const dialog=document.createElement(\'dialog\');dialog.className=\'f63-dialog\';dialog.id=\'f63Review\';F63.dialog=dialog;\n dialog.innerHTML=\'<header><div><span class="f63-eyebrow">MARKET FEED · HUMAN REVIEW</span><h2>Review summary & association</h2></div><button type="button" data-close aria-label="Close review">×</button></header><div class="f63-body"><p>Loading source and workspace candidates…</p></div>\';\n document.body.append(dialog);dialog.showModal();dialog.querySelector(\'[data-close]\').onclick=()=>{if(!F63.busy)dialog.close()};\n dialog.addEventListener(\'cancel\',e=>{if(F63.busy)e.preventDefault()});dialog.addEventListener(\'close\',()=>{dialog.remove();if(F63.dialog===dialog)F63.dialog=null;F63.request++});\n let current=null,summaryDraft=null,destinationDraft=null;\n async function load(selection){\n  const request=++F63.request;F63.busy=true;let loaded=false;dialog.querySelectorAll(\'[data-f63-control],[data-approve]\').forEach(b=>b.disabled=true);\n  try{\n   const data=await api(\'/api/market-feed/review\',{source,id,...(selection?{selection}:{})});\n   if(request!==F63.request||!dialog.isConnected)return;\n   current=data;\n   if(data.processed){dialog.querySelector(\'.f63-body\').textContent=\'This submission has already been processed. Close and refresh the feed.\';return}\n   if(summaryDraft===null)summaryDraft=data.summary||\'\';\n   if(destinationDraft===null)destinationDraft=action===\'idea\'?\'idea\':data.source_kind===\'meeting\'&&data.selected_counterpart_id?\'interaction\':\'insight\';\n   paint();loaded=true;\n  }catch(e){\n   if(dialog.isConnected){const body=dialog.querySelector(\'.f63-body\');let error=body.querySelector(\'.f63-error\');if(!error){error=document.createElement(\'p\');error.className=\'f63-error\';error.setAttribute(\'role\',\'alert\');body.prepend(error)}error.textContent=e.message;if(!current){const retry=document.createElement(\'button\');retry.textContent=\'Retry review\';retry.onclick=()=>load(selection);body.append(retry)}}\n  }finally{F63.busy=false;dialog.querySelectorAll(\'[data-f63-control]\').forEach(b=>b.disabled=current?.source_kind===\'report\'&&[\'f63Target\',\'f63Counterparty\'].includes(b.id));const save=dialog.querySelector(\'[data-approve]\');if(save)save.disabled=!loaded}\n }\n function paint(){\n  const data=current,report=data.source_kind===\'report\',targets=f63Targets();\n  const suggested=new Set((data.candidates||[]).map(c=>f63RefKey(c.ref)));\n  const cpOptions=(S.counterparts||[]).filter(c=>!c.workflow_archived&&!c.market_archived&&c.archived!==true).sort((a,b)=>String(a.name).localeCompare(String(b.name)));\n  const cpSelect=\'<option value="">Unassigned</option>\'+cpOptions.map(c=>\'<option value="\'+E(c.id)+\'" \'+(c.id===data.selected_counterpart_id?\'selected\':\'\')+\'>\'+E(c.name||c.company_name||\'Counterparty\')+\'</option>\').join(\'\');\n  const options=\'<option value="">No linked opportunity</option>\'+targets.map(t=>\'<option value="\'+E(f63RefKey(t.ref))+\'" \'+(f63RefKey(t.ref)===f63RefKey(data.selected_ref)?\'selected\':\'\')+\'>\'+E((suggested.has(f63RefKey(t.ref))?\'Suggested · \':\'\')+(t.ref.type===\'tender\'?\'Tender: \':\'Lead/contract: \')+t.name+(t.counterparty?\' · \'+t.counterparty:\'\'))+\'</option>\').join(\'\');\n  const conflicts=data.fields.some(f=>f.conflict);\n  dialog.querySelector(\'.f63-body\').innerHTML=\'<div class="f63-tags"><span>\'+E(source)+\'</span><span>\'+E(data.category)+\'</span><span>\'+E(data.source_kind===\'meeting\'?\'Possible meeting record\':data.source_kind===\'report\'?\'General report\':\'Commercial / market update\')+\'</span></div><p class="f63-note">\'+E(data.match_explanation)+\'</p><label class="f63-summary-label">Content / Notes: reviewed summary<textarea data-dev25-rich="1" id="f63Summary" maxlength="3000" rows="7">\'+E(summaryDraft)+\'</textarea></label><div class="f63-grid"><label>Linked lead / tender<select id="f63Target" data-f63-control \'+(report?\'disabled\':\'\')+\'>\'+options+\'</select></label><label>Counterparty record<select id="f63Counterparty" data-f63-control \'+(report?\'disabled\':\'\')+\'>\'+cpSelect+\'</select></label><label>Save as<select id="f63Destination" data-f63-control>\'+(action===\'idea\'?\'<option value="idea">Idea</option>\':\'<option value="insight">Market insight</option>\'+(report?\'\':\'<option value="interaction">Counterparty interaction</option>\'))+\'</select></label></div><p class="f63-note">A link does not update the lead, counterparty assignment or commercial terms. Interaction dates use the source-message date; edit the saved interaction if the actual meeting date differs.</p>\'+(data.candidates.length?\'<details class="f63-candidates"><summary>Why these candidates?</summary>\'+data.candidates.map(c=>\'<p><strong>\'+E(c.name)+\'</strong><br>\'+E(c.reason)+\'</p>\').join(\'\')+\'</details>\':\'\')+\'<h3>Source terms versus linked-record context</h3>\'+f63Fields(data.fields)+(conflicts?\'<label class="f63-ack"><input type="checkbox" id="f63Acknowledge"> I have reviewed the differences. The message values remain distinct from the linked record.</label>\':\'\')+\'<details class="f63-original"><summary>Original \'+(source===\'Outlook\'?\'email\':\'Teams message\')+\' and source link</summary><p><strong>\'+E(data.subject||\'Original source\')+\'</strong></p><pre>\'+E(data.original)+\'</pre>\'+(data.source_link?\'<a href="\'+E(data.source_link)+\'" target="_blank" rel="noopener noreferrer">\'+(source===\'Outlook\'?\'Open source email (mailbox access required)\':\'Open source Teams message\')+\'</a>\':\'<p class="f63-note">No source link was supplied by the flow. The original text is preserved here.</p>\')+\'</details>\'+(data.attachment_notice?\'<p class="f63-notice">\'+E(data.attachment_notice)+\'</p>\':\'\')+\'<p class="f63-error" role="alert"></p><footer><button type="button" data-refresh>Refresh review</button><button type="button" data-cancel>Cancel</button><button type="button" data-approve class="primary">Approve & save</button></footer>\';\n  dialog.querySelector(\'#f63Destination\').value=destinationDraft;\n  if(!dialog.querySelector(\'#f63Destination\').value)dialog.querySelector(\'#f63Destination\').value=action===\'idea\'?\'idea\':\'insight\';\n  const capture=()=>{summaryDraft=dialog.querySelector(\'#f63Summary\').value;destinationDraft=dialog.querySelector(\'#f63Destination\').value};\n  const selection=()=>({ref:f63Ref(dialog.querySelector(\'#f63Target\').value),counterpart_id:dialog.querySelector(\'#f63Counterparty\').value||null});\n  dialog.querySelector(\'#f63Target\').onchange=()=>{capture();const chosen=selection();chosen.counterpart_id=null;load(chosen)};\n  dialog.querySelector(\'#f63Counterparty\').onchange=()=>{capture();load(selection())};\n  dialog.querySelector(\'[data-refresh]\').onclick=()=>{capture();load(selection())};\n  dialog.querySelector(\'[data-cancel]\').onclick=()=>{if(!F63.busy)dialog.close()};\n  dialog.querySelector(\'[data-approve]\').onclick=async()=>{\n   if(F63.busy)return;capture();const error=dialog.querySelector(\'.f63-error\');error.textContent=\'\';\n   if(!summaryDraft.trim()){error.textContent=\'Add a concise summary before approval.\';return}\n   if(conflicts&&!dialog.querySelector(\'#f63Acknowledge\').checked){error.textContent=\'Review and acknowledge the highlighted differences.\';return}\n   if(destinationDraft===\'interaction\'&&!current.selected_counterpart_id){error.textContent=\'Select an existing counterparty before saving an interaction.\';return}\n   F63.busy=true;dialog.querySelector(\'[data-approve]\').disabled=true;\n   try{\n    const payload={action,summary:summaryDraft,destination:destinationDraft,selected_ref:current.selected_ref,counterpart_id:current.selected_counterpart_id,source_digest:current.source_digest,workspace_revision:current.workspace_revision,acknowledge_conflicts:conflicts?dialog.querySelector(\'#f63Acknowledge\').checked:false};\n    payload[source===\'Outlook\'?\'feed_id\':\'message_id\']=id;\n    const result=await api(source===\'Outlook\'?\'/api/outlook-feed/action\':\'/api/teams-feed/action\',payload);\n    F63.busy=false;dialog.close();\n    if(result.reload_workspace){location.reload();return}\n    if(source===\'Outlook\')await o57Load();else await t49Load();\n    toast(result.already_processed?\'Already processed.\':\'Saved with reviewed summary and association.\');\n   }catch(e){error.textContent=e.message;F63.busy=false;dialog.querySelector(\'[data-approve]\').disabled=false}\n  };\n }\n await load();\n}\nconst f63TeamsAction=t49Action;\nt49Action=function(id,action){return [\'insight\',\'idea\'].includes(action)?f63Review(\'Teams\',id,action):f63TeamsAction(id,action)};\nconst f63OutlookAction=o57Action;\no57Action=function(id,action){return [\'insight\',\'idea\'].includes(action)?f63Review(\'Outlook\',id,action):f63OutlookAction(id,action)};\nconst f63Paint=t49Paint;\nt49Paint=function(...args){const result=f63Paint.apply(this,args);document.querySelectorAll(\'#t49Root .t55-approve\').forEach(b=>{b.textContent=\'Review & approve\';b.title=\'Review summary, proposed links and field provenance before saving\'});return result};\nfunction f63SourcePanel(item){\n const review=item.feed_review;if(!review)return null;\n const section=document.createElement(\'section\');section.className=\'f63-saved-source\';\n section.innerHTML=\'<h3>Reviewed association & field provenance</h3><p class="f63-note">Snapshot at approval. Later lead changes do not rewrite this source record.</p>\'+f63Fields(review.fields||[]);\n if(review.selected_ref){const b=document.createElement(\'button\');b.type=\'button\';b.textContent=\'Open linked \'+review.selected_ref.type+\': \'+(review.selected_name||review.selected_ref.id);b.onclick=()=>{document.querySelectorAll(\'.modal.open\').forEach(h=>{if(h.oriClose)h.oriClose()});if(review.selected_ref.type===\'tender\'&&typeof dev21OpenTender===\'function\')dev21OpenTender(review.selected_ref.id);else openRecord(review.selected_ref.type,review.selected_ref.id)};section.append(b)}\n const details=document.createElement(\'details\');details.className=\'f63-original\';const heading=document.createElement(\'summary\');heading.textContent=\'Original source message\';const pre=document.createElement(\'pre\');pre.textContent=item.outlook_original_message??item.teams_original_message??\'\';details.append(heading,pre);section.append(details);\n if(review.source_link){const a=document.createElement(\'a\');a.href=review.source_link;a.target=\'_blank\';a.rel=\'noopener noreferrer\';a.textContent=review.source===\'Outlook\'?\'Open source email (mailbox access required)\':\'Open source Teams message\';try{const u=new URL(a.href);const allowed=review.source===\'Outlook\'?[\'outlook.office.com\',\'outlook.office365.com\',\'outlook.cloud.microsoft\']:[\'teams.microsoft.com\',\'teams.cloud.microsoft\'];if(u.protocol===\'https:\'&&allowed.includes(u.hostname)&&!u.username&&!u.password)section.append(a)}catch(e){}}\n else{const p=document.createElement(\'p\');p.className=\'f63-note\';p.textContent=\'No source link was supplied. The original source text remains available above.\';section.append(p)}\n if(review.attachment_notice){const p=document.createElement(\'p\');p.className=\'f63-notice\';p.textContent=review.attachment_notice;section.append(p)}\n return section;\n}\nconst f63Open=m45Open;\nm45Open=function(key){const result=f63Open(key),r=m45Find(key);if(!r?.item?.feed_review)return result;const host=[...document.querySelectorAll(\'.ori31-dialog-body\')].at(-1);if(host){const intro=document.createElement(\'p\');intro.className=\'f63-note\';intro.textContent=\'Commercial fields may include linked-record context. The provenance table below distinguishes message terms from stored lead/tender terms.\';host.prepend(intro);host.querySelectorAll(\'.fact\').forEach(f=>{if(f.querySelector(\'label\')?.textContent===\'Source\'){const v=f.querySelector(\'div\');if(v)v.textContent=r.item.feed_review.source+\' (reviewed feed submission)\'}});const notes=host.querySelector(\'.m45-detail-body\');if(notes){notes.textContent=r.item.body||r.item.observation||r.item.interesting||\'\';notes.style.whiteSpace=\'pre-wrap\'}const section=f63SourcePanel(r.item);if(section)host.append(section)}return result};\nconst f63Landing=landing;\nlanding=function(...args){const result=f63Landing.apply(this,args);if(route.ref){const item=entity(route.ref);if(item?.feed_review){const host=$(\'landingContent\')||$(\'page\');if(!host.querySelector(\'.f63-saved-source\'))host.append(f63SourcePanel(item))}}return result};\nconst f63Interaction=ori31ViewInteraction;\nori31ViewInteraction=function(id){const result=f63Interaction(id),item=(S.communications||[]).find(x=>x.id===id);if(item?.feed_review){const host=[...document.querySelectorAll(\'.ori31-dialog-body\')].at(-1);if(host&&!host.querySelector(\'.f63-saved-source\'))host.append(f63SourcePanel(item))}return result};\nif(document.querySelector(\'#t49Root\'))t49Paint();\n</script>'
+HTML=HTML.replace('</body>',_MARKET63_UI+'</body>')
+HTML=HTML.replace('LNG ORI Workspace v62','LNG ORI Workspace v63')
+
 if __name__=='__main__':main()
 
 # END LNG ORI V17 PRESENTATION
