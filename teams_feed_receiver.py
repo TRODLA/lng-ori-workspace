@@ -150,7 +150,7 @@ def _feed_source_link(value, chat_id, message_id):
     from urllib.parse import urlparse, quote
     value = str(value or '').strip()
     parsed = urlparse(value)
-    if parsed.scheme == 'https' and parsed.hostname in ('teams.microsoft.com', 'teams.cloud.microsoft'):
+    if parsed.scheme == 'https' and parsed.hostname in ('teams.microsoft.com', 'teams.cloud.microsoft') and not parsed.username and not parsed.password:
         return value
     if chat_id and message_id:
         return 'https://teams.microsoft.com/l/message/' + quote(str(chat_id), safe='') + '/' + quote(str(message_id), safe='') + '?context=%7B%22contextType%22%3A%22chat%22%7D'
@@ -173,10 +173,13 @@ def store_message(body):
         'sender_id': safe_text(body.get('sender_id'), 500),
         'created_at': safe_text(body.get('created_at'), 100),
         'message': original, 'original_message': original,
-        'message_link': _feed_source_link(body.get('message_link'), chat_id, message_id),
+        'message_link': _feed_source_link(body.get('message_link') or body.get('webLink') or body.get('web_link'), chat_id, message_id),
         'received_at': timestamp, 'processed': False,
         'ai_status': 'not_provided', 'ai_extraction': None,
     }
+    metadata = _feed63_metadata(body, 'Teams')
+    metadata['message_link'] = metadata['message_link'] or envelope['message_link']
+    envelope.update(metadata)
     supplied = body.get('ai_extraction')
     if supplied is not None and supplied != '':
         try:
@@ -352,10 +355,11 @@ def store_outlook_message(body):
         'sender_email': safe_text(body.get('sender_email') or body.get('from'), 500),
         'created_at': safe_text(body.get('received_at') or body.get('created_at') or body.get('receivedDateTime'), 100),
         'received_at': timestamp, 'message': plain, 'original_message': plain,
-        'original_html': html, 'message_link': _outlook57_link(body.get('message_link')),
+        'original_html': html, 'message_link': _outlook57_link(body.get('message_link') or body.get('webLink') or body.get('web_link')),
         'processed': False, 'ai_status': 'not_provided', 'ai_extraction': None,
         'attachments_processed': False,
     }
+    envelope.update(_feed63_metadata(body, 'Outlook'))
     if body.get('ai_extraction') not in (None, ''):
         try:
             raw = _feed_ai_unwrap(body['ai_extraction'])
@@ -445,7 +449,31 @@ Handler.do_GET = _outlook57_get
 Handler.do_POST = _outlook57_post
 Handler.server_version = 'ORI-MarketFeed/4.0'
 
+
+# V63: preserve only validated source links and attachment metadata, never
+# attachment bytes. The ingestion secret, routes and storage paths are unchanged.
+def _feed63_link(value, source):
+    parsed = urlparse(str(value or '').strip())
+    hosts = ('outlook.office.com','outlook.office365.com','outlook.cloud.microsoft') if source == 'Outlook' else ('teams.microsoft.com','teams.cloud.microsoft')
+    if parsed.scheme == 'https' and parsed.hostname in hosts and not parsed.username and not parsed.password:
+        return str(value).strip()
+    return ''
+
+
+def _feed63_metadata(body, source):
+    link = _feed63_link(body.get('message_link') or body.get('webLink') or body.get('web_link'), source)
+    attachments = body.get('attachments')
+    names = []
+    if isinstance(attachments, list):
+        for attachment in attachments[:100]:
+            if isinstance(attachment, dict):
+                name = str(attachment.get('name') or attachment.get('Name') or '').strip()[:300]
+                if name:
+                    names.append(name)
+    return {'message_link':link, 'attachment_names':names,
+            'has_attachments':bool(body.get('hasAttachments') or body.get('has_attachments') or names),
+            'attachments_processed':False, 'source_link_supplied':bool(link)}
+
 if __name__ == "__main__":
     print(f"Starting Teams feed receiver with AI Builder payload support on port {PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
-
